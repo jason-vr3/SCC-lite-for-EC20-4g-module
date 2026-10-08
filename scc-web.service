@@ -1,0 +1,14 @@
+[Unit]
+Description=SCC-lite Web UI (port 7577)
+After=network.target scc-lite.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/scc-lite-for-EC20-4g-module
+ExecStart=/usr/bin/python3 /opt/scc-lite-for-EC20-4g-module/scc-web.py --config /opt/scc-lite-for-EC20-4g-module/config.yaml
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
