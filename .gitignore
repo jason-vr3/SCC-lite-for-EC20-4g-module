@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# SQLite 数据库 / SQLite databases
+*.db
+*.db-journal
+data/
+
+# 配置文件（可能含密码）/ Config (may contain passwords)
+# 注意：config.yaml.example 可以提交，config.yaml 不要提交
+# Note: config.yaml.example is OK to commit, config.yaml is not
+config.yaml
+
+# QQ openid 缓存 / QQ openid cache
+qq_openids.json
+
+# 系统文件 / System files
+.DS_Store
+*.log
