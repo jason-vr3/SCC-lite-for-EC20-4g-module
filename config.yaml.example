@@ -1,0 +1,51 @@
+# SCC-lite (SMS Control Centre) - Configuration
+# Copy to /opt/scc-lite-for-EC20-4g-module/config.yaml and adjust.
+
+# Modem AT port (SMS/USSD/device info). Must NOT conflict with voice.
+# Example: /dev/ttyUSB3 when Asterisk uses /dev/ttyUSB2.
+modem:
+  port: /dev/ttyUSB3
+  baudrate: 115200
+  timeout: 10          # seconds per AT command
+
+# SMS polling
+sms:
+  poll_interval: 15          # seconds between AT+CMGL polls
+  delete_after_forward: true # delete from SIM after forwarding (prevents SIM full)
+
+# Data directory (SQLite DB lives here)
+data_dir: /opt/scc-lite-for-EC20-4g-module/data
+
+# Web UI
+web:
+  port: 7577
+  username: admin
+  password: admin   # CHANGE ME after first login (edit this file, restart scc-web)
+
+# Cellular data (QMI)
+data:
+  qmi_dev: /dev/cdc-wdm0
+  iface: wwan0
+  apn: ""            # leave empty for auto; e.g. "3gnet", "cmnet"
+
+# Notification channels - all disabled by default.
+# Enable and fill in via web UI (通知 tab), or edit here.
+notifications:
+  qq:
+    enabled: false
+    app_id: ""
+    app_secret: ""
+    openid: ""       # receiver OpenID (user must have messaged the bot first)
+  telegram:
+    enabled: false
+    bot_token: ""    # from @BotFather
+    chat_id: ""      # your chat ID
+  webhook:
+    enabled: false
+    url: ""
+    headers: {}
+    secret: ""
+  bark:
+    enabled: false
+    key: ""          # Bark app device key
+    server: "https://api.day.app"
