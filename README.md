@@ -9,7 +9,8 @@
 SMS Control Centre - 4G module SMS gateway with push notifications
 
 ---
-![Uploading image.png…]()
+<img width="1920" height="890" alt="image" src="https://github.com/user-attachments/assets/a156ac1d-1e44-454c-958c-d2eb0bc24820" />
+
 
 ## 简介 / Introduction
 
