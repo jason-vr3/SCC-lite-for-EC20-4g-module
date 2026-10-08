@@ -1,0 +1,14 @@
+[Unit]
+Description=SCC-lite SMS daemon (AT polling)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/scc-lite-for-EC20-4g-module
+ExecStart=/usr/bin/python3 /opt/scc-lite-for-EC20-4g-module/scc-lite.py --config /opt/scc-lite-for-EC20-4g-module/config.yaml
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
