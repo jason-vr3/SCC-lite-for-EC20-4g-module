@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SCC-lite 短信中心</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--green:#8bc34a;--green-dark:#689f38;--bg:#f5f7f4;--card:#fff;
+ --text:#2e3a2e;--muted:#7a8a7a;--border:#e4eae4}
+body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+ background:var(--bg);color:var(--text);font-size:14px;display:flex;min-height:100vh}
+/* Sidebar */
+.sidebar{width:210px;background:#fff;border-right:1px solid var(--border);
+ display:flex;flex-direction:column;position:fixed;top:0;bottom:0;left:0;z-index:10}
+.sidebar .logo{padding:18px 16px;font-size:20px;font-weight:800;color:var(--green-dark);
+ border-bottom:1px solid var(--border)}
+.sidebar .logo small{display:block;font-size:11px;color:var(--muted);font-weight:400}
+.sidebar nav{flex:1;overflow-y:auto;padding:10px 8px}
+.sidebar nav button{display:flex;align-items:center;gap:10px;width:100%;border:0;
+ background:none;padding:11px 12px;font-size:14px;cursor:pointer;color:#4a5a4a;
+ border-radius:12px;margin-bottom:2px;text-align:left}
+.sidebar nav button:hover{background:#f0f5ef}
+.sidebar nav button.active{background:var(--green);color:#fff;font-weight:600}
+.sidebar nav button .ico{font-size:17px;width:24px;text-align:center}
+.sidebar .user{padding:12px 16px;border-top:1px solid var(--border);font-size:13px;
+ display:flex;justify-content:space-between;align-items:center}
+.sidebar .user a{color:var(--muted);text-decoration:none}
+/* Main */
+.main{flex:1;margin-left:210px;padding:20px;max-width:1100px}
+.main h1.page-title{font-size:24px;margin-bottom:4px}
+.main .page-sub{color:var(--muted);font-size:13px;margin-bottom:16px}
+.card{background:var(--card);border-radius:16px;padding:18px;margin-bottom:14px;
+ box-shadow:0 1px 4px rgba(0,0,0,.05)}
+.card h2{font-size:16px;margin-bottom:12px}
+.card h3{font-size:14px;margin:12px 0 8px;color:#4a5a4a}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+input,select,textarea{border:1px solid #d0d8d0;border-radius:10px;padding:9px 12px;
+ font-size:14px;width:100%;background:#fbfdfb}
+input:focus{outline:2px solid var(--green);border-color:var(--green)}
+input[type=checkbox]{width:auto}
+button.btn{background:var(--green);color:#fff;border:0;border-radius:20px;
+ padding:8px 22px;font-size:14px;cursor:pointer;font-weight:600}
+button.btn:hover{background:var(--green-dark)}
+button.btn.danger{background:#e57373}
+button.btn.ghost{background:#eef3ee;color:#4a5a4a}
+button.btn:disabled{background:#ccc}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--muted);font-weight:500}
+.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px}
+.badge.ok{background:#e8f5e9;color:#2e7d32}
+.badge.bad{background:#ffebee;color:#c62828}
+.badge.info{background:#e8f5e9;color:var(--green-dark)}
+pre{background:#263238;color:#c3e88d;border-radius:12px;padding:12px;overflow-x:auto;
+ font-size:12px;max-height:500px;overflow-y:auto}
+.hidden{display:none}
+label{font-size:13px;color:var(--muted)}
+.msg{border-left:3px solid var(--green);padding:10px 12px;margin-bottom:8px;
+ background:#fafcfa;border-radius:0 12px 12px 0}
+.msg.out{border-color:#66bb6a}
+.msg .meta{font-size:12px;color:var(--muted);margin-bottom:4px}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:6px 10px;font-size:13px}
+.kv dt{color:var(--muted)}.kv dd{margin:0;word-break:break-all}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px}
+.stat{background:var(--card);border-radius:16px;padding:16px;text-align:center;
+ box-shadow:0 1px 4px rgba(0,0,0,.05)}
+.stat .num{font-size:26px;font-weight:700;color:var(--green-dark)}
+.stat .lbl{font-size:12px;color:var(--muted);margin-top:4px}
+@media(max-width:768px){.sidebar{width:64px}.sidebar .logo small,.sidebar nav button span.txt,.sidebar .user span{display:none}.main{margin-left:64px}}
+</style></head>
+<body>
+<aside class="sidebar">
+<div class="logo">📡 SCC-lite<small>SMS Control Centre</small></div>
+<nav id="tabs">
+<button data-t="dash" class="active"><span class="ico">📊</span><span class="txt">仪表盘</span></button>
+<button data-t="sms"><span class="ico">💬</span><span class="txt">短信中心</span></button>
+<button data-t="device"><span class="ico">📱</span><span class="txt">设备管理</span></button>
+<button data-t="data"><span class="ico">🌐</span><span class="txt">蜂窝网络</span></button>
+<button data-t="ussd"><span class="ico">⌨️</span><span class="txt">USSD</span></button>
+<button data-t="at"><span class="ico">💻</span><span class="txt">AT 终端</span></button>
+<button data-t="ec20"><span class="ico">📖</span><span class="txt">EC20 资料</span></button>
+<button data-t="atdoc"><span class="ico">📚</span><span class="txt">AT 速查</span></button>
+<button data-t="logs"><span class="ico">📋</span><span class="txt">实时日志</span></button>
+<button data-t="notify"><span class="ico">🔔</span><span class="txt">消息推送</span></button>
+</nav>
+<div class="user"><span>👤 Admin</span><a href="/logout">退出</a></div>
+</aside>
+<div class="main">
+<!-- Dashboard -->
+<section id="t-dash">
+<h1 class="page-title">仪表盘</h1><p class="page-sub">实时查看设备状态与短信</p>
+<div class="stats">
+<div class="stat"><div class="num" id="st-signal">-</div><div class="lbl">信号 RSSI</div></div>
+<div class="stat"><div class="num" id="st-reg">-</div><div class="lbl">网络注册</div></div>
+<div class="stat"><div class="num" id="st-sms">-</div><div class="lbl">短信总数</div></div>
+<div class="stat"><div class="num" id="st-data">-</div><div class="lbl">蜂窝网络</div></div>
+</div>
+<div class="card"><h2>最新短信</h2><div id="dash-sms">加载中…</div></div>
+</section>
+<!-- SMS -->
+<section id="t-sms" class="hidden">
+<h1 class="page-title">短信中心</h1><p class="page-sub">收发短信，会话记录</p>
+<div class="card"><h2>发送短信</h2>
+<div class="row"><input id="sms-to" placeholder="收件号码，如 13800138000" style="flex:2">
+<input id="sms-text" placeholder="短信内容" style="flex:3"></div>
+<div class="row"><button class="btn" onclick="sendSms()">发送</button>
+<span id="sms-send-status"></span></div></div>
+<div class="card"><h2>收件箱 <button class="btn ghost" onclick="loadSms()">刷新</button></h2>
+<div id="sms-list">加载中…</div></div>
+</section>
+<!-- Device -->
+<section id="t-device" class="hidden">
+<h1 class="page-title">设备管理</h1><p class="page-sub">模组状态与射频控制</p>
+<div class="card"><h2>设备状态 <button class="btn ghost" onclick="loadDevice()">刷新</button></h2>
+<div id="device-info">加载中…</div></div>
+<div class="card"><h2>飞行模式</h2>
+<div class="row"><span id="flight-status">未知</span>
+<button class="btn" onclick="setFlight(true)">开启飞行模式</button>
+<button class="btn ghost" onclick="setFlight(false)">关闭飞行模式</button></div></div>
+</section>
+<!-- Data -->
+<section id="t-data" class="hidden">
+<h1 class="page-title">蜂窝网络</h1><p class="page-sub">QMI 数据连接管理</p>
+<div class="card"><h2>数据连接 <button class="btn ghost" onclick="loadData()">刷新</button></h2>
+<div id="data-info">加载中…</div>
+<div class="row" style="margin-top:8px">
+<button class="btn" id="btn-data-on" onclick="dataOn()">开启上网</button>
+<button class="btn danger" id="btn-data-off" onclick="dataOff()">关闭上网</button></div></div>
+<div class="card"><h2>Ping 测试</h2>
+<div class="row"><input id="ping-target" value="114.114.114.114" style="flex:2">
+<button class="btn" onclick="pingTest()">Ping 3 次</button></div>
+<div id="ping-result"></div></div>
+</section>
+<!-- USSD -->
+<section id="t-ussd" class="hidden">
+<h1 class="page-title">USSD</h1><p class="page-sub">交互式运营商指令（如查余额）</p>
+<div class="card"><h2>USSD 会话</h2>
+<div class="row"><input id="ussd-code" placeholder="如 *101#" style="flex:2">
+<button class="btn" onclick="ussdSend()">发送</button>
+<button class="btn ghost" onclick="ussdCancel()">取消会话</button></div>
+<pre id="ussd-result">等待输入…</pre></div>
+</section>
+<!-- AT terminal -->
+<section id="t-at" class="hidden">
+<h1 class="page-title">AT 终端</h1><p class="page-sub">直接执行 AT 指令</p>
+<div class="card"><h2>AT 命令</h2>
+<div class="row"><input id="at-cmd" placeholder="如 AT+CSQ" style="flex:3">
+<button class="btn" onclick="atSend()">执行</button></div>
+<pre id="at-result">等待输入…</pre></div>
+</section>
+<!-- EC20 资料 -->
+<section id="t-ec20" class="hidden">
+<h1 class="page-title">EC20 资料</h1><p class="page-sub">EC20 全系规格速查</p>
+<div class="card"><h2>EC20 全系 <button class="btn ghost" onclick="loadEc20()">刷新</button></h2>
+<div id="ec20-info">加载中…</div></div>
+</section>
+<!-- AT 速查 -->
+<section id="t-atdoc" class="hidden">
+<h1 class="page-title">AT 速查</h1><p class="page-sub">EC20 指令速查（标注出处）</p>
+<div class="card"><h2>指令搜索</h2>
+<div class="row"><input id="atdoc-q" placeholder="输入关键字，如 SMS / CREG / QCFG" style="flex:3">
+<button class="btn" onclick="loadAtdoc()">搜索</button></div>
+<div class="row" id="atdoc-cats"></div>
+<div id="atdoc-list">加载中…</div>
+<p style="font-size:12px;color:var(--muted);margin-top:8px">出处：[3GPP]=3GPP TS 27.007，[Q]=Quectel AT 手册，[QCFG]=Quectel QCFG 手册</p></div>
+</section>
+<!-- 实时日志 -->
+<section id="t-logs" class="hidden">
+<h1 class="page-title">实时日志</h1><p class="page-sub">守护进程与 Web 日志</p>
+<div class="card"><h2>日志
+<button class="btn ghost" onclick="loadLogs()">刷新</button>
+<label style="margin-left:8px"><input type="checkbox" id="log-auto" checked onchange="toggleLogAuto()"> 自动刷新(5s)</label></h2>
+<div class="row">
+<button class="btn ghost" onclick="logService='scc-lite';loadLogs()">守护进程</button>
+<button class="btn ghost" onclick="logService='scc-web';loadLogs()">Web</button>
+<span id="log-service-label" style="font-size:13px;color:var(--muted)">scc-lite</span></div>
+<pre id="log-output">加载中…</pre></div>
+</section>
+<!-- Notify -->
+<section id="t-notify" class="hidden">
+<h1 class="page-title">消息推送</h1><p class="page-sub">通知渠道按需启用</p>
+<div class="card"><h2>通知渠道</h2><div id="notify-form">加载中…</div>
+<div class="row"><button class="btn" onclick="saveNotify()">保存</button>
+<span id="notify-status"></span></div></div>
+</section>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
+ document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('active'));
+ b.classList.add('active');
+ document.querySelectorAll('.main>section').forEach(s=>s.classList.add('hidden'));
+ $('t-'+b.dataset.t).classList.remove('hidden');
+ ({dash:loadDash,sms:loadSms,device:loadDevice,data:loadData,notify:loadNotify,ec20:loadEc20,atdoc:loadAtdoc,logs:loadLogs}[b.dataset.t]||(()=>{}))();
+});
+async function api(p,o={}){const r=await fetch(p,{...o,headers:{'Content-Type':'application/json',...(o.headers||{})}});
+ if(r.status===401){location.reload();return null} return r.json()}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function loadDash(){const [dev,sms,data]=await Promise.all([api('/api/device'),api('/api/sms'),api('/api/data')]);
+ if(dev){$('st-signal').textContent=dev.signal?.rssi??'-';
+  const rs={0:'未注册',1:'已注册',2:'搜索中',3:'被拒',5:'漫游'};$('st-reg').textContent=rs[dev.reg?.stat]??'-';}
+ if(sms)$('st-sms').textContent=sms.messages.length;
+ if(data)$('st-data').textContent=data.connected?(data.ip||'已连接'):'未连接';
+ if(sms)$('dash-sms').innerHTML=sms.messages.slice(0,5).map(m=>
+  `<div class="msg ${m.direction}"><div class="meta">${m.direction==='in'?'📩':'📤'} ${esc(m.sender)} · ${esc(m.sms_time||m.created_at)}</div><div>${esc(m.body?.slice(0,80))}</div></div>`).join('')||'暂无短信';}
+async function loadSms(){const d=await api('/api/sms');if(!d)return;
+ $('sms-list').innerHTML=d.messages.length?d.messages.map(m=>
+ `<div class="msg ${m.direction}"><div class="meta">${m.direction==='in'?'📩':'📤'} ${esc(m.sender)} · ${esc(m.sms_time||m.created_at)} ${m.forwarded?'· <span class="badge ok">已推送</span>':''}</div><div>${esc(m.body)}</div></div>`).join(''):'暂无短信';}
+async function sendSms(){const to=$('sms-to').value.trim(),text=$('sms-text').value;
+ if(!to||!text)return alert('填写号码和内容');
+ $('sms-send-status').textContent='发送中…';
+ const d=await api('/api/sms/send',{method:'POST',body:JSON.stringify({to,text})});
+ $('sms-send-status').textContent=d&&d.ok?'✅ 已发送':'❌ '+(d&&d.error||'失败');
+ if(d&&d.ok){$('sms-text').value='';loadSms();}}
+async function loadDevice(){const d=await api('/api/device');if(!d)return;
+ const r=d.reg||{};const regTxt={0:'未注册',1:'已注册(本地)',2:'搜索中',3:'被拒绝',5:'已注册(漫游)'}[r.stat]??('stat='+r.stat);
+ $('device-info').innerHTML=`<dl class="kv">
+ <dt>IMEI</dt><dd>${esc(d.imei)}</dd><dt>IMSI</dt><dd>${esc(d.imsi)}</dd>
+ <dt>ICCID</dt><dd>${esc(d.iccid)}</dd><dt>信号</dt><dd>RSSI ${d.signal?.rssi??'-'} ${d.signal&&d.signal.rssi<=31?'<span class="badge '+(d.signal.rssi>=15?'ok':'bad')+'">'+(d.signal.rssi>=15?'良好':'较弱')+'</span>':''}</dd>
+ <dt>注册</dt><dd>${regTxt}</dd><dt>运营商</dt><dd>${esc(d.operator?.oper||'-')}</dd>
+ <dt>串口</dt><dd>${esc(d.port)}</dd></dl>`;
+ $('flight-status').innerHTML=d.flight_mode?'<span class="badge bad">飞行模式开</span>':'<span class="badge ok">正常</span>';}
+async function setFlight(on){const d=await api('/api/device/flight',{method:'POST',body:JSON.stringify({enable:on})});
+ alert(d&&d.ok?'已执行，等待 modem 生效':'失败: '+(d&&d.error));loadDevice();}
+async function loadData(){const d=await api('/api/data');if(!d)return;
+ $('data-info').innerHTML=`<dl class="kv">
+ <dt>状态</dt><dd>${d.connected?'<span class="badge ok">已连接</span>':'<span class="badge bad">未连接</span>'}</dd>
+ <dt>IP</dt><dd>${esc(d.ip||'-')}</dd><dt>网卡</dt><dd>${esc(d.iface)}</dd></dl>`;
+ $('btn-data-on').disabled=d.connected;$('btn-data-off').disabled=!d.connected;}
+async function dataOn(){$('data-info').innerHTML='拨号中…(约10秒)';
+ const d=await api('/api/data/on',{method:'POST'});alert(d&&d.ok?'已连接':'失败: '+(d&&d.error));loadData();}
+async function dataOff(){const d=await api('/api/data/off',{method:'POST'});
+ alert(d&&d.ok?'已断开':'失败');loadData();}
+async function pingTest(){const t=$('ping-target').value.trim()||'114.114.114.114';
+ $('ping-result').innerHTML='测试中…';
+ const d=await api('/api/data/ping',{method:'POST',body:JSON.stringify({target:t})});
+ $('ping-result').innerHTML=d?`<dl class="kv"><dt>目标</dt><dd>${esc(t)}</dd>
+ <dt>结果</dt><dd>${d.ok?'<span class="badge ok">通</span>':'<span class="badge bad">不通</span>'}</dd>
+ <dt>平均时延</dt><dd>${d.avg_ms} ms</dd><dt>丢包</dt><dd>${d.loss_pct}%</dd></dl>`:'失败';}
+async function ussdSend(){const c=$('ussd-code').value.trim();if(!c)return;
+ $('ussd-result').textContent='发送中…';
+ const d=await api('/api/ussd',{method:'POST',body:JSON.stringify({code:c})});
+ $('ussd-result').textContent=(d&&d.ok?d.response:'❌ '+(d&&d.error||'失败'));}
+async function ussdCancel(){await api('/api/ussd/cancel',{method:'POST'});$('ussd-result').textContent='已取消';}
+async function atSend(){const c=$('at-cmd').value.trim();if(!c)return;
+ $('at-result').textContent='执行中…';
+ const d=await api('/api/at',{method:'POST',body:JSON.stringify({cmd:c})});
+ $('at-result').textContent=d?(d.lines||[]).join('\n'):'失败';}
+async function loadEc20(){const d=await api('/api/ec20');if(!d)return;
+ let h='<h3>通用规格</h3><dl class="kv">';
+ for(const [k,v] of Object.entries(d.common))h+=`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`;
+ h+='</dl><h3>版本对照</h3>';
+ h+='<table><tr><th>版本</th><th>地区/用途</th><th>LTE FDD</th><th>LTE TDD</th><th>WCDMA</th><th>TD-SCDMA</th><th>CDMA</th><th>GSM</th></tr>';
+ for(const [v,i] of Object.entries(d.variants))h+=`<tr><td><b>${esc(v)}</b></td><td>${esc(i.region)}<br><span style="color:var(--muted)">${esc(i.use)}</span></td><td>${esc(i.lte_fdd)}</td><td>${esc(i.lte_tdd)}</td><td>${esc(i.wcdma)}</td><td>${esc(i.tdscdma)}</td><td>${esc(i.cdma)}</td><td>${esc(i.gsm)}</td></tr>`;
+ h+='</table>';
+ h+=`<p style="font-size:12px;color:var(--muted);margin-top:8px">${esc(d.firmware_note)}</p>`;
+ h+=`<p style="font-size:13px;margin-top:6px"><b>典型应用：</b>${d.applications.map(esc).join('、')}</p>`;
+ $('ec20-info').innerHTML=h;}
+let atdocCat='';
+async function loadAtdoc(cat){if(cat!==undefined)atdocCat=cat;
+ const q=$('atdoc-q').value.trim();
+ const d=await api('/api/atdoc?q='+encodeURIComponent(q)+'&cat='+encodeURIComponent(atdocCat));if(!d)return;
+ $('atdoc-cats').innerHTML='<button class="btn ghost" onclick="loadAtdoc(\'\')">全部</button> '+
+  Object.entries(d.categories).map(([k,v])=>`<button class="btn ${atdocCat===k?'':'ghost'}" onclick="loadAtdoc('${k}')">${esc(v)}</button>`).join(' ');
+ $('atdoc-list').innerHTML=d.commands.length?'<table><tr><th>指令</th><th>说明</th><th>出处</th><th>示例</th></tr>'+
+  d.commands.map(c=>`<tr><td><code>${esc(c.cmd)}</code></td><td>${esc(c.desc)}</td><td><span class="badge info">${esc(c.src)}</span></td><td><code>${esc(c.example)}</code></td></tr>`).join('')+'</table>':'无匹配';}
+let logService='scc-lite',logTimer=null;
+async function loadLogs(){const d=await api('/api/logs?service='+encodeURIComponent(logService));if(!d)return;
+ $('log-service-label').textContent=logService;
+ $('log-output').textContent=d.logs||'(无日志)';
+ $('log-output').scrollTop=$('log-output').scrollHeight;}
+function toggleLogAuto(){if($('log-auto').checked){logTimer=setInterval(loadLogs,5000);}else{clearInterval(logTimer);logTimer=null;}}
+document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>{
+ if(b.dataset.t==='logs'&&$('log-auto').checked&&!logTimer)logTimer=setInterval(loadLogs,5000);
+ if(b.dataset.t!=='logs'&&logTimer){clearInterval(logTimer);logTimer=null;}
+}));
+let notifyCfg={};
+async function loadNotify(){const d=await api('/api/notify');if(!d)return;notifyCfg=d;
+ const f=(n,title,fields)=>`<h3>${title}
+ <input type="checkbox" data-n="${n}" data-k="enabled" ${d[n]?.enabled?'checked':''}> 启用</h3>`+
+ fields.map(([k,label,ph])=>`<div class="row"><label style="width:110px">${label}</label>
+ <input data-n="${n}" data-k="${k}" value="${esc(d[n]?.[k]??'')}" placeholder="${ph||''}"></div>`).join('');
+ $('notify-form').innerHTML=
+ f('qq','QQ Bot',[['app_id','AppID',''],['app_secret','AppSecret',''],['openid','接收 OpenID','']])+
+ f('telegram','Telegram',[['bot_token','Bot Token',''],['chat_id','Chat ID','']])+
+ f('webhook','Webhook',[['url','URL','https://…'],['secret','Secret(可选)','']])+
+ f('bark','Bark',[['key','Key',''],['server','服务器','https://api.day.app']]);}
+async function saveNotify(){document.querySelectorAll('#notify-form input').forEach(i=>{
+ const n=i.dataset.n,k=i.dataset.k;notifyCfg[n]=notifyCfg[n]||{};
+ notifyCfg[n][k]=i.type==='checkbox'?i.checked:i.value;});
+ const d=await api('/api/notify',{method:'POST',body:JSON.stringify(notifyCfg)});
+ $('notify-status').textContent=d&&d.ok?'✅ 已保存':'❌ 失败';}
+loadDash();
+</script></body></html>
