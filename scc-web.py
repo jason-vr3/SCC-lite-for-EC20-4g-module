@@ -450,7 +450,7 @@ label{font-size:13px;color:var(--muted)}
 <div class="row" style="margin-top:8px"><input id="apn-input" placeholder="手动填写 APN，如 cbnet" style="flex:2">
 <button class="btn" onclick="setApn()">下发 APN</button></div>
 <div class="row" style="margin-top:8px"><span>USB 网络模式：</span><b id="usbnet-mode">-</b>
-<button class="btn ghost" onclick="switchMode()">切换 ECM/QMI</button></div></div>
+<span class="muted" style="font-size:12px">(仅显示，切换有风险已禁用)</span></div></div>
 <div class="card"><h2>Ping 测试</h2>
 <div class="row"><input id="ping-target" value="2400:3200::1" style="flex:2">
 <button class="btn" onclick="pingTest()">Ping 3 次</button></div>
@@ -763,13 +763,6 @@ async function setApn(){const a=$('apn-input').value.trim();if(!a){alert('APN �
  alert(d&&d.ok?'APN 已下发到模块':'失败: '+(d&&d.error));}
 async function loadUsbnetMode(){const d=await api('/api/data/mode');if(!d||!d.ok)return;
  $('usbnet-mode').textContent=d.name+' ('+d.mode+')';}
-async function switchMode(){const d=await api('/api/data/mode');if(!d||!d.ok)return;
- const cur=d.mode;const target=cur===1?0:1;
- const tname=target===1?'ECM':'QMI';
- if(!confirm('切换到 '+tname+' 模式需要重启模块（语音/短信中断约1分钟），确定？'))return;
- if(!confirm('再次确认：真的要切换到 '+tname+' 吗？'))return;
- const r=await api('/api/data/mode',{method:'POST',body:JSON.stringify({mode:target})});
- alert(r&&r.ok?'已下发，请在 AT 终端执行 AT+CFUN=1,1 重启':'失败: '+(r&&r.error));}
 const IMPL_NOTES=`【ECM 模式上网实现】(2026-10-08 N1 实测)
 # 1. 模块设为 ECM 模式 (只需做一次)
 AT+QCFG="usbnet",1
@@ -1770,26 +1763,11 @@ def api_data_mode():
 @requires_auth
 def api_data_mode_set():
     """
-    切换 usbnet 模式. body: {"mode": 1}
-    注意: 需重启模块生效, 前端必须二次确认.
-    这里只下发指令, 不自动重启 (返回 need_reboot=True).
+    切换 usbnet 模式 (v0.5.6: 已禁用, 有风险).
+    仅保留 GET 查询显示, POST 直接拒绝.
     """
-    try:
-        mode = int(request.get_json(force=True).get("mode"))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "mode 必须是 0-3 的整数"})
-    if mode not in USBNET_MODES:
-        return jsonify({"ok": False, "error": "mode 越界"})
-    try:
-        m = _get_modem_for_data()
-        try:
-            ok = set_usbnet_mode(m, mode)
-        finally:
-            m.close()
-        return jsonify({"ok": ok, "need_reboot": True,
-                        "message": "已下发，需 AT+CFUN=1,1 重启生效"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": False,
+                    "error": "模式切换已禁用 (有风险), 请用 AT 指令手动操作"})
 
 
 # ----------------------------------------------------------------------
