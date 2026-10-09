@@ -21,14 +21,17 @@ import argparse
 import functools
 import logging
 import os
+import re
 import sqlite3
 import yaml
 
-VERSION = "0.5.0"
+VERSION = "0.5.5"
 from flask import Flask, request, jsonify, render_template_string, Response
 
 from modem import Modem, ModemError
-from data_control import DataControl
+from data_control import (get_data_controller, get_usbnet_mode,
+                            get_carrier_info, provision_apn,
+                            set_usbnet_mode, USBNET_MODES)
 from notifications import Notifier
 from ec20_data import EC20_COMMON, EC20_VARIANTS, FIRMWARE_NOTE, APPLICATIONS
 from at_cheatsheet import search as at_search, by_category as at_by_cat, CATEGORIES
@@ -74,12 +77,19 @@ def get_store():
 
 
 def get_data_ctl():
-    d = config.get("data", {})
-    return DataControl(
-        qmi_dev=d.get("qmi_dev", "/dev/cdc-wdm0"),
-        iface=d.get("iface", "wwan0"),
-        apn=d.get("apn", ""),
-    )
+    # modem_factory: 每次新建 Modem, 避免与短信模块抢串口
+    def _factory():
+        m = get_modem()
+        return m
+    at_port = config.get("modem", {}).get("port", "/dev/ttyUSB3")
+    return get_data_controller(config, modem_factory=_factory,
+                               at_port=at_port)
+
+
+def _get_modem_for_data():
+    """数据相关 AT 操作用的 Modem (用完即关)."""
+    m = get_modem()
+    return m
 
 
 # ----------------------------------------------------------------------
@@ -186,7 +196,7 @@ label{font-size:13px;color:var(--muted)}
 </style></head>
 <body>
 <aside class="sidebar">
-<div class="logo">📡 SCC-lite<small>SMS Control Centre v0.5.0</small></div>
+<div class="logo">📡 SCC-lite<small>SMS Control Centre v0.5.5</small></div>
 <nav id="tabs">
 <button data-t="dash" class="active"><span class="ico">📊</span><span class="txt">仪表盘</span></button>
 <button data-t="sms"><span class="ico">💬</span><span class="txt">短信中心</span></button>
@@ -199,7 +209,20 @@ label{font-size:13px;color:var(--muted)}
 <button data-t="logs"><span class="ico">📋</span><span class="txt">实时日志</span></button>
 <button data-t="notify"><span class="ico">🔔</span><span class="txt">消息推送</span></button>
 </nav>
-<div class="user"><span>👤 Admin</span><a href="/logout">退出</a></div>
+<div class="user"><span id="user-label" onclick="openAccountModal()" style="cursor:pointer" title="点击修改账户">👤 Admin</span><a href="/logout">退出</a></div>
+<!-- 修改账户模态框 -->
+<div id="account-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:99;align-items:center;justify-content:center">
+<div style="background:#fff;border-radius:8px;padding:24px;width:320px">
+<h3 style="margin-bottom:16px">修改登录账户+密码</h3>
+<div style="margin-bottom:12px"><label style="font-size:13px">用户名</label><input id="acc-username" style="width:100%;margin-top:4px"></div>
+<div style="margin-bottom:12px"><label style="font-size:13px">旧密码 <span style="color:#999">(验证身份)</span></label><input id="acc-oldpw" type="password" style="width:100%;margin-top:4px"></div>
+<div style="margin-bottom:12px"><label style="font-size:13px">新密码 <span style="color:#999">(至少4位)</span></label><input id="acc-newpw" type="password" style="width:100%;margin-top:4px"></div>
+<div style="margin-bottom:12px"><label style="font-size:13px">确认新密码</label><input id="acc-newpw2" type="password" style="width:100%;margin-top:4px"></div>
+<div style="font-size:12px;color:#666;margin-bottom:16px">改用户名时必须同时设新密码（至少4位），不能为空</div>
+<div id="acc-msg" style="font-size:13px;color:#c00;margin-bottom:12px"></div>
+<div style="display:flex;gap:8px;justify-content:flex-end">
+<button class="btn ghost" onclick="closeAccountModal()">取消</button>
+<button class="btn" onclick="submitAccountChange()">保存</button></div></div></div>
 </aside>
 <div class="main">
 <!-- Dashboard -->
@@ -211,7 +234,11 @@ label{font-size:13px;color:var(--muted)}
 <div class="stat"><div class="num" id="st-sms">-</div><div class="lbl">短信总数</div></div>
 <div class="stat"><div class="num" id="st-data">-</div><div class="lbl">蜂窝网络</div></div>
 </div>
-<div class="card"><h2>最新短信</h2><div id="dash-sms">加载中…</div></div>
+<div class="card"><h2>本地设备信息 <button class="btn ghost" onclick="loadDashSys()">刷新</button></h2>
+<div id="dash-sys">加载中…</div></div>
+<div class="card"><h2>4G 模块 <button class="btn ghost" onclick="loadDashModem()">刷新</button></h2>
+<div id="dash-modem">加载中…</div>
+<p class="muted">点击模块可跳转到设备管理页查看详情</p></div>
 </section>
 <!-- SMS (iOS style) -->
 <section id="t-sms" class="hidden">
@@ -273,16 +300,31 @@ label{font-size:13px;color:var(--muted)}
 </section>
 <!-- Data -->
 <section id="t-data" class="hidden">
-<h1 class="page-title">蜂窝网络</h1><p class="page-sub">QMI 数据连接管理</p>
+<h1 class="page-title">蜂窝网络</h1><p class="page-sub">QMI 数据连接管理 (v0.5.5 纯 QMI)</p>
 <div class="card"><h2>数据连接 <button class="btn ghost" onclick="loadData()">刷新</button></h2>
 <div id="data-info">加载中…</div>
+<div id="data-stages" style="margin-top:12px"></div>
 <div class="row" style="margin-top:8px">
 <button class="btn" id="btn-data-on" onclick="dataOn()">开启上网</button>
-<button class="btn danger" id="btn-data-off" onclick="dataOff()">关闭上网</button></div></div>
+<button class="btn danger" id="btn-data-off" onclick="dataOff()">关闭上网</button>
+<button class="btn ghost" id="btn-conn-test" onclick="testConnectivity()">测试连通性</button></div>
+<div id="conn-result" style="margin-top:8px"></div></div>
+<div class="card"><h2>QMI 操作日志 <button class="btn ghost" onclick="toggleOpLog()">展开/折叠</button>
+<button class="btn ghost" onclick="loadOpLog()">刷新</button></h2>
+<div id="oplog-box" style="display:none"><pre id="oplog-output" style="max-height:300px;overflow-y:auto">点击刷新查看…</pre></div></div>
+<div class="card"><h2>运营商与 APN <button class="btn ghost" onclick="loadCarrier()">识别</button></h2>
+<div id="carrier-info">点击"识别"自动检测…</div>
+<div class="row" style="margin-top:8px"><input id="apn-input" placeholder="手动填写 APN，如 cbnet" style="flex:2">
+<button class="btn" onclick="setApn()">下发 APN</button></div>
+<div class="row" style="margin-top:8px"><span>USB 网络模式：</span><b id="usbnet-mode">-</b>
+<button class="btn ghost" onclick="switchMode()">切换 ECM/QMI</button></div></div>
 <div class="card"><h2>Ping 测试</h2>
-<div class="row"><input id="ping-target" value="114.114.114.114" style="flex:2">
+<div class="row"><input id="ping-target" value="2400:3200::1" style="flex:2">
 <button class="btn" onclick="pingTest()">Ping 3 次</button></div>
-<div id="ping-result"></div></div>
+<div id="ping-result"></div>
+<p class="muted">注：广电 IPv4 被拦截，请用 IPv6 目标测试</p></div>
+<div class="card"><h2>实现说明 <button class="btn ghost" onclick="copyImpl()">复制指令</button></h2>
+<pre id="impl-notes">加载中…</pre></div>
 </section>
 <!-- USSD -->
 <section id="t-ussd" class="hidden">
@@ -326,6 +368,7 @@ label{font-size:13px;color:var(--muted)}
 <div class="row">
 <button class="btn ghost" onclick="logService='scc-lite';loadLogs()">守护进程</button>
 <button class="btn ghost" onclick="logService='scc-web';loadLogs()">Web</button>
+<button class="btn ghost" onclick="logService='qmi';loadLogs()">QMI 拨号</button>
 <span id="log-service-label" style="font-size:13px;color:var(--muted)">scc-lite</span></div>
 <pre id="log-output">加载中…</pre></div>
 </section>
@@ -339,6 +382,7 @@ label{font-size:13px;color:var(--muted)}
 </div>
 <script>
 const $=id=>document.getElementById(id);
+function goTab(t){const b=document.querySelector(`#tabs button[data-t="${t}"]`);if(b)b.click();}
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
  document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('active'));
  b.classList.add('active');
@@ -353,9 +397,44 @@ async function loadDash(){const [dev,sms,data]=await Promise.all([api('/api/devi
  if(dev){$('st-signal').textContent=dev.signal?.rssi??'-';
   const rs={0:'未注册',1:'已注册',2:'搜索中',3:'被拒',5:'漫游'};$('st-reg').textContent=rs[dev.reg?.stat]??'-';}
  if(sms)$('st-sms').textContent=sms.messages.length;
- if(data)$('st-data').textContent=data.connected?(data.ip||'已连接'):'未连接';
- if(sms)$('dash-sms').innerHTML=sms.messages.slice(0,5).map(m=>
-  `<div class="msg ${m.direction}"><div class="meta">${m.direction==='in'?'📩':'📤'} ${esc(m.sender)} · ${esc(m.sms_time||m.created_at)}</div><div>${esc(m.body?.slice(0,80))}</div></div>`).join('')||'暂无短信';}
+ if(data)$('st-data').textContent=data.connected?((data.ipv6&&data.ipv6[0])||data.ip||'已连接'):'未连接';
+ loadDashSys();loadDashModem();}
+function bar(pct){const c=pct>80?'#e53935':(pct>60?'#fb8c00':'#8bc34a');
+ return `<div style="background:#eee;border-radius:4px;height:8px;flex:1"><div style="background:${c};height:8px;border-radius:4px;width:${Math.min(pct,100)}%"></div></div>`;}
+async function loadDashSys(){const d=await api('/api/system');if(!d)return;
+ const ifs=d.interfaces||[];
+ const defIf=ifs.find(i=>i.is_default)||ifs.find(i=>i.name!=='lo')||{};
+ const defIp=[...(defIf.ipv4||[]),...(defIf.ipv6||[])].join('<br>')||'-';
+ const allIfs=ifs.filter(i=>i.name!=='lo').map(i=>
+  `<div style="font-size:12px;padding:6px 0;border-bottom:1px solid var(--border)">`+
+  `<b>${esc(i.name)}</b>${i.is_default?' <span class="badge ok">默认</span>':''}<br>`+
+  `IPv4: ${i.ipv4.map(esc).join(', ')||'-'}<br>`+
+  `IPv6: ${i.ipv6.map(esc).join(', ')||'-'}<br>`+
+  `<span style="color:var(--muted)">MAC ${esc(i.mac)} · ↓${esc(i.rx)} ↑${esc(i.tx)}</span></div>`
+ ).join('')||'无';
+ $('dash-sys').innerHTML=`<dl class="kv">
+ <dt>CPU</dt><dd>${esc(d.cpu_model||'-')} (${d.cpu_cores}核)</dd>
+ <dt>CPU 占用</dt><dd style="display:flex;gap:8px;align-items:center">${bar(d.cpu_usage||0)}<span>${d.cpu_usage??'-'}%</span></dd>
+ <dt>内存</dt><dd style="display:flex;gap:8px;align-items:center">${bar(d.mem_usage||0)}<span>${d.mem_used_mb}/${d.mem_total_mb} MB (${d.mem_usage??'-'}%)</span></dd>
+ <dt>磁盘 /</dt><dd style="display:flex;gap:8px;align-items:center">${bar(d.disk_usage||0)}<span>${d.disk_used_gb}/${d.disk_total_gb} GB (${d.disk_usage??'-'}%)</span></dd>
+ <dt>主网卡</dt><dd>${esc(defIf.name||'-')} (${defIp})</dd>
+ <dt>网关</dt><dd>${esc(d.gateway||'-')}</dd>
+ <dt>DNS</dt><dd>${(d.dns||[]).map(esc).join('<br>')||'-'}</dd>
+ <dt>运行时间</dt><dd>${esc(d.uptime||'-')}</dd>
+ <dt>负载</dt><dd>${(d.loadavg||[]).join(' ')||'-'}</dd></dl>
+ <div style="margin-top:8px"><a href="javascript:void(0)" onclick="toggleIfs()" style="font-size:13px">展开所有网卡 (${ifs.filter(i=>i.name!=='lo').length}) ▾</a>
+ <div id="ifs-detail" style="display:none;margin-top:4px">${allIfs}</div></div>`;}
+function toggleIfs(){const b=$('ifs-detail');b.style.display=b.style.display==='none'?'block':'none';}
+async function loadDashModem(){const d=await api('/api/device');if(!d)return;
+ const rs={0:'未注册',1:'已注册(本地)',2:'搜索中',3:'被拒绝',5:'已注册(漫游)'}[d.reg?.stat]??'-';
+ $('dash-modem').innerHTML=`<div onclick="goTab('device')" style="cursor:pointer"><dl class="kv">
+ <dt>型号</dt><dd>${esc(d.model||'-')}</dd>
+ <dt>IMEI</dt><dd>${esc(d.imei||'-')}</dd>
+ <dt>IMSI</dt><dd>${esc(d.imsi||'-')}</dd>
+ <dt>信号</dt><dd>RSSI ${d.signal?.rssi??'-'}</dd>
+ <dt>注册</dt><dd>${rs}</dd>
+ <dt>运营商</dt><dd>${esc(d.operator?.oper||'-')}</dd>
+ <dt>串口</dt><dd>${esc(d.port||'-')}</dd></dl></div>`;}
 let smsMessages=[],currentContact=null;
 async function loadSms(){const d=await api('/api/sms');if(!d)return;
  smsMessages=d.messages;
@@ -439,25 +518,113 @@ async function loadDevice(){const d=await api('/api/device');if(!d)return;
  <dt>IMEI</dt><dd>${esc(d.imei)}</dd><dt>IMSI</dt><dd>${esc(d.imsi)}</dd>
  <dt>ICCID</dt><dd>${esc(d.iccid)}</dd><dt>信号</dt><dd>RSSI ${d.signal?.rssi??'-'} ${d.signal&&d.signal.rssi<=31?'<span class="badge '+(d.signal.rssi>=15?'ok':'bad')+'">'+(d.signal.rssi>=15?'良好':'较弱')+'</span>':''}</dd>
  <dt>注册</dt><dd>${regTxt}</dd><dt>运营商</dt><dd>${esc(d.operator?.oper||'-')}</dd>
- <dt>串口</dt><dd>${esc(d.port)}</dd></dl>`;
+ <dt>串口</dt><dd>${esc(d.port)} <button class="btn ghost" style="font-size:12px;padding:2px 8px" onclick="editPort('${esc(d.port)}')">修改</button></dd></dl>
+ <div id="port-edit" style="display:none;margin-top:8px"><div class="row">
+ <input id="port-input" placeholder="/dev/ttyUSB3" style="flex:2">
+ <button class="btn" onclick="savePort()">保存</button>
+ <button class="btn ghost" onclick="$('port-edit').style.display='none'">取消</button></div>
+ <p class="muted">应急修改串口，保存后需重启 scc-lite 服务生效</p></div>`;
  $('flight-status').innerHTML=d.flight_mode?'<span class="badge bad">飞行模式开</span>':'<span class="badge ok">正常</span>';}
+function editPort(cur){$('port-input').value=cur||'/dev/ttyUSB3';$('port-edit').style.display='block';}
+async function savePort(){const p=$('port-input').value.trim();if(!p)return alert('串口不能为空');
+ const d=await api('/api/device/port',{method:'POST',body:JSON.stringify({port:p})});
+ alert(d&&d.ok?('已保存: '+d.port+'，'+(d.note||'')):'失败: '+(d&&d.error));loadDevice();}
 async function setFlight(on){const d=await api('/api/device/flight',{method:'POST',body:JSON.stringify({enable:on})});
  alert(d&&d.ok?'已执行，等待 modem 生效':'失败: '+(d&&d.error));loadDevice();}
 async function loadData(){const d=await api('/api/data');if(!d)return;
+ const v6=(d.ipv6||[]).map(esc).join('<br>')||'-';
+ const ipChg=d.ip_changed?`<div style="margin-top:8px;padding:8px;background:#fff8e1;border-radius:4px;font-size:13px">⚠️ IP 发生变化: ${esc(d.ip_change_msg||'')}<button class="btn ghost" style="margin-left:8px" onclick="clearIpChange()">知道了</button></div>`:'';
  $('data-info').innerHTML=`<dl class="kv">
+ <dt>模式</dt><dd>${esc(d.mode_name||d.mode||'-')}</dd>
  <dt>状态</dt><dd>${d.connected?'<span class="badge ok">已连接</span>':'<span class="badge bad">未连接</span>'}</dd>
- <dt>IP</dt><dd>${esc(d.ip||'-')}</dd><dt>网卡</dt><dd>${esc(d.iface)}</dd></dl>`;
- $('btn-data-on').disabled=d.connected;$('btn-data-off').disabled=!d.connected;}
-async function dataOn(){$('data-info').innerHTML='拨号中…(约10秒)';
- const d=await api('/api/data/on',{method:'POST'});alert(d&&d.ok?'已连接':'失败: '+(d&&d.error));loadData();}
-async function dataOff(){const d=await api('/api/data/off',{method:'POST'});
+ <dt>IP 类型</dt><dd>${d.ip_type?('IPv'+d.ip_type):'-'}</dd>
+ <dt>IPv6</dt><dd>${v6}</dd><dt>IPv4</dt><dd>${esc(d.ipv4||'-')}</dd>
+ <dt>网卡</dt><dd>${esc(d.iface)}</dd></dl>${ipChg}`;
+ $('btn-data-on').disabled=d.connected;$('btn-data-off').disabled=!d.connected;
+ loadCarrier();loadUsbnetMode();loadImplNotes();}
+async function dataOn(){$('data-info').innerHTML='连接中…(约10-20秒)';
+ const d=await api('/api/data/on',{method:'POST'});
+ if(d&&d.ok){await loadData();testConnectivity();}
+ else{alert('失败: '+(d&&d.error));loadData();}}
+async function clearIpChange(){await api('/api/data/ipchange/clear',{method:'POST'});loadData();}
+// 三段式连通性: bearer -> IP -> 互联网
+async function testConnectivity(){$('conn-result').innerHTML='测试中…(约10秒)';
+ const d=await api('/api/data/connectivity');if(!d||d.error){$('conn-result').innerHTML='测试失败';return;}
+ const b1=d.bearer?'<span class="badge ok">✅ 已建立</span>':'<span class="badge bad">❌ 未建立</span>';
+ const b2=(d.has_ipv4||d.has_ipv6)?'<span class="badge ok">✅ 已获取</span>':'<span class="badge bad">❌ 未获取</span>';
+ const v4txt=d.internet_v4===null?'-':(d.internet_v4?'<span class="badge ok">✅ 通</span>':'<span class="badge bad">❌ 不通</span>');
+ const v6txt=d.internet_v6===null?'-':(d.internet_v6?'<span class="badge ok">✅ 通</span>':'<span class="badge bad">❌ 不通</span>');
+ $('conn-result').innerHTML=`<dl class="kv">
+ <dt>① Bearer</dt><dd>${b1} <span class="muted">${esc(d.bearer_detail||'')}</span></dd>
+ <dt>② 获取 IP</dt><dd>${b2}</dd>
+ <dt style="padding-left:16px">IPv4</dt><dd>${esc(d.ipv4||'-')}</dd>
+ <dt style="padding-left:16px">IPv6</dt><dd>${(d.ipv6||[]).map(esc).join('<br>')||'-'}</dd>
+ <dt>③ 访问互联网</dt><dd>IPv4: ${v4txt} &nbsp; IPv6: ${v6txt}</dd></dl>`;
+ $('data-stages').innerHTML='';}
+// 操作日志折叠
+function toggleOpLog(){const b=$('oplog-box');b.style.display=b.style.display==='none'?'block':'none';if(b.style.display==='block')loadOpLog();}
+async function loadOpLog(){const d=await api('/api/data/oplog');if(!d)return;
+ $('oplog-output').textContent=(d.logs||[]).join('\n')||'(空)';}
+// 修改账户
+async function openAccountModal(){const d=await api('/api/account');if(d&&d.username)$('acc-username').value=d.username;
+ $('acc-oldpw').value='';$('acc-newpw').value='';$('acc-newpw2').value='';$('acc-msg').textContent='';
+ $('account-modal').style.display='flex';}
+function closeAccountModal(){$('account-modal').style.display='none';}
+async function submitAccountChange(){
+ const npw=$('acc-newpw').value, npw2=$('acc-newpw2').value;
+ if(npw!==npw2){$('acc-msg').textContent='两次输入的新密码不一致';return;}
+ if(npw.length<4){$('acc-msg').textContent='新密码至少 4 位';return;}
+ const d=await api('/api/account/change',{method:'POST',body:JSON.stringify({
+  username:$('acc-username').value.trim(),
+  old_password:$('acc-oldpw').value,new_password:npw})});
+ if(d&&d.ok){alert('已保存，下次登录生效');closeAccountModal();}
+ else{$('acc-msg').textContent=d&&(d.error||'失败');}}
+async function dataOff(){if(!confirm('关闭上网将断开 PDP（省电），确定？'))return;
+ const d=await api('/api/data/off',{method:'POST'});
  alert(d&&d.ok?'已断开':'失败');loadData();}
-async function pingTest(){const t=$('ping-target').value.trim()||'114.114.114.114';
+async function pingTest(){const t=$('ping-target').value.trim()||'2400:3200::1';
  $('ping-result').innerHTML='测试中…';
  const d=await api('/api/data/ping',{method:'POST',body:JSON.stringify({target:t})});
  $('ping-result').innerHTML=d?`<dl class="kv"><dt>目标</dt><dd>${esc(t)}</dd>
  <dt>结果</dt><dd>${d.ok?'<span class="badge ok">通</span>':'<span class="badge bad">不通</span>'}</dd>
  <dt>平均时延</dt><dd>${d.avg_ms} ms</dd><dt>丢包</dt><dd>${d.loss_pct}%</dd></dl>`:'失败';}
+async function loadCarrier(){const d=await api('/api/data/carrier');if(!d||!d.ok)return;
+ $('carrier-info').innerHTML=`<dl class="kv">
+ <dt>运营商</dt><dd>${esc(d.carrier||'-')}</dd><dt>IMSI</dt><dd>${esc(d.imsi||'-')}</dd>
+ <dt>网络</dt><dd>${esc(d.operator||'-')}</dd><dt>识别APN</dt><dd>${esc(d.apn||'-')}</dd>
+ <dt>MCC/MNC</dt><dd>${esc(d.mcc||'')}/${esc(d.mnc||'')}</dd>
+ <dt>来源</dt><dd>${esc(d.source||'-')}</dd></dl>`;
+ if(d.apn)$('apn-input').value=d.apn;}
+async function setApn(){const a=$('apn-input').value.trim();if(!a){alert('APN 不能为空');return;}
+ const d=await api('/api/data/apn',{method:'POST',body:JSON.stringify({apn:a})});
+ alert(d&&d.ok?'APN 已下发到模块':'失败: '+(d&&d.error));}
+async function loadUsbnetMode(){const d=await api('/api/data/mode');if(!d||!d.ok)return;
+ $('usbnet-mode').textContent=d.name+' ('+d.mode+')';}
+async function switchMode(){const d=await api('/api/data/mode');if(!d||!d.ok)return;
+ const cur=d.mode;const target=cur===1?0:1;
+ const tname=target===1?'ECM':'QMI';
+ if(!confirm('切换到 '+tname+' 模式需要重启模块（语音/短信中断约1分钟），确定？'))return;
+ if(!confirm('再次确认：真的要切换到 '+tname+' 吗？'))return;
+ const r=await api('/api/data/mode',{method:'POST',body:JSON.stringify({mode:target})});
+ alert(r&&r.ok?'已下发，请在 AT 终端执行 AT+CFUN=1,1 重启':'失败: '+(r&&r.error));}
+const IMPL_NOTES=`【ECM 模式上网实现】(2026-10-08 N1 实测)
+# 1. 模块设为 ECM 模式 (只需做一次)
+AT+QCFG="usbnet",1
+AT+CFUN=1,1   # 重启生效, usb0 网卡出现
+# 2. 下发 APN (重启后需重下发)
+AT+CGDCONT=1,"IPV4V6","cbnet"
+# 3. 开启上网
+AT+CGACT=1,1
+ip link set usb0 up
+# 等待 IPv6: ip -6 addr show usb0
+# 4. 测试 (广电 IPv4 被拦截, 用 IPv6)
+ping -6 -I usb0 2400:3200::1
+# 5. 关闭上网 (省电)
+ip link set usb0 down
+AT+CGACT=0,1
+# 运营商自动识别: AT+CIMI 取 IMSI -> 查内置 APN 库 (26000+ 条)`;
+async function loadImplNotes(){$('impl-notes').textContent=IMPL_NOTES;}
+function copyImpl(){navigator.clipboard.writeText(IMPL_NOTES).then(()=>alert('已复制'),()=>alert('复制失败'));}
 async function ussdSend(){const c=$('ussd-code').value.trim();if(!c)return;
  $('ussd-result').textContent='发送中…';
  const d=await api('/api/ussd',{method:'POST',body:JSON.stringify({code:c})});
@@ -486,7 +653,12 @@ async function loadAtdoc(cat){if(cat!==undefined)atdocCat=cat;
  $('atdoc-list').innerHTML=d.commands.length?'<table><tr><th>指令</th><th>说明</th><th>出处</th><th>示例</th></tr>'+
   d.commands.map(c=>`<tr><td><code>${esc(c.cmd)}</code></td><td>${esc(c.desc)}</td><td><span class="badge info">${esc(c.src)}</span></td><td><code>${esc(c.example)}</code></td></tr>`).join('')+'</table>':'无匹配';}
 let logService='scc-lite',logTimer=null;
-async function loadLogs(){const d=await api('/api/logs?service='+encodeURIComponent(logService));if(!d)return;
+async function loadLogs(){
+ if(logService==='qmi'){const d=await api('/api/data/oplog');if(!d)return;
+  $('log-service-label').textContent='qmi';
+  $('log-output').textContent=(d.logs||[]).join('\n')||'(无日志)';
+  $('log-output').scrollTop=$('log-output').scrollHeight;return;}
+ const d=await api('/api/logs?service='+encodeURIComponent(logService));if(!d)return;
  $('log-service-label').textContent=logService;
  $('log-output').textContent=d.logs||'(无日志)';
  $('log-output').scrollTop=$('log-output').scrollHeight;}
@@ -540,8 +712,24 @@ def index():
 
 @app.route("/logout")
 def logout():
-    return Response("已退出，请关闭浏览器标签页", 401,
-                    {"WWW-Authenticate": 'Basic realm="SCC-lite"'})
+    # Basic Auth 无标准登出: 用 XHR 带错误账密请求一次, 把浏览器缓存的旧账密顶掉
+    # (XHR 的 401 不会弹框), 再跳回主页, 由主页的 401 自然弹出登录框.
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>已退出 - SCC-lite</title></head>
+<body style="font-family:sans-serif;text-align:center;padding-top:80px">
+<h2>已退出登录</h2><p>正在跳转到登录页…</p>
+<p><a href="/">如果没有自动跳转, 点这里</a></p>
+<script>
+function go(){location.href='/';}
+try{
+ var xhr=new XMLHttpRequest();
+ xhr.open('GET','/api/account',true,'logout','logout');
+ xhr.onload=go; xhr.onerror=go; xhr.ontimeout=go;
+ xhr.timeout=3000; xhr.send();
+ setTimeout(go,3500);
+}catch(e){go();}
+</script></body></html>"""
+    return Response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
 
 
 # ----------------------------------------------------------------------
@@ -655,10 +843,21 @@ def api_data():
 @app.route("/api/data/on", methods=["POST"])
 @requires_auth
 def api_data_on():
-    ok = get_data_ctl().start()
-    d = get_data_ctl().get_status()
-    return jsonify({"ok": ok, "error": "" if ok else "拨号失败，查日志",
-                    **d})
+    ctl = get_data_ctl()
+    ok = ctl.start()
+    d = ctl.get_status()
+    err = ""
+    if not ok:
+        err = "连接失败"
+        if getattr(ctl, "mode", "ecm") == "qmi":
+            import shutil
+            if not shutil.which("qmicli"):
+                err = "未安装 qmicli (apt install libqmi-utils)"
+    elif not d.get("connected"):
+        err = "已执行但未连接，检查 APN/信号"
+    elif not d.get("ip") and not d.get("ipv6"):
+        err = "已连接但未获取 IP"
+    return jsonify({"ok": ok and d.get("connected"), "error": err, **d})
 
 
 @app.route("/api/data/off", methods=["POST"])
@@ -671,8 +870,383 @@ def api_data_off():
 @app.route("/api/data/ping", methods=["POST"])
 @requires_auth
 def api_data_ping():
-    target = request.get_json(force=True).get("target", "114.114.114.114")
-    return jsonify(get_data_ctl().ping_test(target, count=3))
+    # v0.5.5: QMI 自动选 IP 类型, ping 目标默认按当前类型
+    # 用户可在页面输入框改目标
+    ctl = get_data_ctl()
+    st = ctl.get_status()
+    default = "114.114.114.114" if st.get("ip_type") == 4 else "2400:3200::1"
+    target = request.get_json(force=True).get("target", default)
+    return jsonify(ctl.ping_test(target, count=3))
+
+
+@app.route("/api/data/oplog")
+@requires_auth
+def api_data_oplog():
+    """QMI 操作日志 (拨号全过程, 供分析)."""
+    ctl = get_data_ctl()
+    fn = getattr(ctl, "get_op_log", None)
+    logs = fn(100) if fn else []
+    return jsonify({"logs": logs})
+
+
+@app.route("/api/data/ipchange/clear", methods=["POST"])
+@requires_auth
+def api_data_ipchange_clear():
+    """清除 IP 变化提醒标记 (用户已读)."""
+    ctl = get_data_ctl()
+    fn = getattr(ctl, "clear_ip_change_flag", None)
+    if fn:
+        fn()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/data/connectivity")
+@requires_auth
+def api_data_connectivity():
+    """三段式连通性检查: bearer -> IP -> 互联网 (v4/v6 分开)."""
+    ctl = get_data_ctl()
+    fn = getattr(ctl, "check_internet", None)
+    if fn:
+        return jsonify(fn())
+    return jsonify({"error": "not supported"})
+
+
+@app.route("/api/device/port", methods=["POST"])
+@requires_auth
+def api_device_port():
+    """
+    修改 modem 串口 (v0.5.5, 应急用).
+    写回 config.yaml 的 modem.port, 需重启 scc-lite 生效.
+    """
+    import re
+    data = request.get_json(force=True) or {}
+    port = (data.get("port") or "").strip()
+    if not re.fullmatch(r"/dev/[A-Za-z0-9_.-]+", port):
+        return jsonify({"ok": False, "error": "串口格式非法"})
+    if "modem" not in config:
+        config["modem"] = {}
+    config["modem"]["port"] = port
+    try:
+        save_config()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"保存失败: {e}"})
+    return jsonify({"ok": True, "port": port,
+                    "note": "需重启 scc-lite 服务生效"})
+
+
+@app.route("/api/account", methods=["GET"])
+@requires_auth
+def api_account_info():
+    """当前登录账户名 (不返回密码)."""
+    w = config.get("web", {})
+    return jsonify({"username": w.get("username", "admin")})
+
+
+@app.route("/api/system")
+@requires_auth
+def api_system():
+    """
+    本机系统信息 (v0.5.5 仪表盘用):
+    CPU/内存/磁盘/网卡/IP/DNS/网关/运行时间/负载.
+    """
+    import shutil
+    info = {}
+    # ip 命令绝对路径 (systemd 的 PATH 可能没有 /usr/sbin)
+    IP_BIN = "/usr/sbin/ip"
+    import os as _os
+    if not _os.path.exists(IP_BIN):
+        IP_BIN = "/sbin/ip" if _os.path.exists("/sbin/ip") else "ip"
+    # CPU (兼容 ARM: 无 model name, 用 Hardware/Processor/Model)
+    try:
+        with open("/proc/cpuinfo") as f:
+            txt = f.read()
+        models = re.findall(r"model name\s*:\s*(.+)", txt)
+        if models:
+            info["cpu_model"] = models[0].strip()
+            info["cpu_cores"] = len(models)
+        else:
+            # ARM 格式
+            m = re.search(r"Hardware\s*:\s*(.+)", txt)
+            if not m:
+                m = re.search(r"^Model\s*:\s*(.+)", txt, re.M)
+            info["cpu_model"] = m.group(1).strip() if m else "ARM"
+            procs = re.findall(r"^processor\s*:", txt, re.M)
+            info["cpu_cores"] = len(procs) or (os.cpu_count() or 1)
+    except Exception:
+        info["cpu_model"] = "未知"
+        info["cpu_cores"] = os.cpu_count() or 1
+    # CPU 占用 (两次采样)
+    try:
+        def _cpu_times():
+            with open("/proc/stat") as f:
+                p = f.readline().split()
+            vals = list(map(int, p[1:8]))
+            return sum(vals), vals[3]  # total, idle
+        t1, i1 = _cpu_times()
+        time.sleep(0.5)
+        t2, i2 = _cpu_times()
+        info["cpu_usage"] = round(100 * (1 - (i2 - i1) / max(t2 - t1, 1)), 1)
+    except Exception:
+        info["cpu_usage"] = 0
+    # 内存
+    try:
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                m = re.match(r"(\w+):\s+(\d+)", line)
+                if m:
+                    mem[m.group(1)] = int(m.group(2))
+        total = mem.get("MemTotal", 0)
+        avail = mem.get("MemAvailable", mem.get("MemFree", 0))
+        info["mem_total_mb"] = total // 1024
+        info["mem_used_mb"] = (total - avail) // 1024
+        info["mem_usage"] = round(100 * (total - avail) / max(total, 1), 1)
+    except Exception:
+        info["mem_total_mb"] = info["mem_used_mb"] = 0
+        info["mem_usage"] = 0
+    # 磁盘 (根分区)
+    try:
+        du = shutil.disk_usage("/")
+        info["disk_total_gb"] = round(du.total / 1e9, 1)
+        info["disk_used_gb"] = round(du.used / 1e9, 1)
+        info["disk_usage"] = round(100 * du.used / max(du.total, 1), 1)
+    except Exception:
+        info["disk_total_gb"] = info["disk_used_gb"] = 0
+        info["disk_usage"] = 0
+    # 运行时间 / 负载
+    try:
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+        d, rem = divmod(int(up), 86400)
+        h, rem = divmod(rem, 3600)
+        m, _ = divmod(rem, 60)
+        info["uptime"] = f"{d}天{h}时{m}分" if d else f"{h}时{m}分"
+    except Exception:
+        info["uptime"] = "-"
+    try:
+        with open("/proc/loadavg") as f:
+            info["loadavg"] = f.read().split()[:3]
+    except Exception:
+        info["loadavg"] = []
+    # 网关 + 默认网卡 (先取, 供默认显示用)
+    info["gateway"] = ""
+    info["default_iface"] = ""
+    try:
+        rc, out, _ = _run_shell([IP_BIN, "route", "show", "default"], timeout=10)
+        if rc == 0:
+            m = re.search(r"default via ([\d.:a-fA-F]+)\s+dev\s+(\S+)", out)
+            if m:
+                info["gateway"] = m.group(1)
+                info["default_iface"] = m.group(2)
+    except Exception:
+        pass
+    # 网卡详情 (含 MAC、流量, 供展开显示)
+    info["interfaces"] = []
+    try:
+        rc, out, _ = _run_shell([IP_BIN, "-o", "addr", "show"], timeout=10)
+        ifaces = {}
+        if rc == 0:
+            for line in out.splitlines():
+                m = re.match(r"\d+:\s+(\S+)\s+inet\s+([\d.]+)/\d+", line)
+                if m:
+                    name = m.group(1)
+                    ifaces.setdefault(name, {"name": name, "ipv4": [], "ipv6": []})
+                    if name != "lo":
+                        ifaces[name]["ipv4"].append(m.group(2))
+                m = re.match(r"\d+:\s+(\S+)\s+inet6\s+([0-9a-fA-F:]+)/\d+\s+scope global", line)
+                if m:
+                    name = m.group(1)
+                    ifaces.setdefault(name, {"name": name, "ipv4": [], "ipv6": []})
+                    ifaces[name]["ipv6"].append(m.group(2))
+        # MAC + 流量
+        rc2, out2, _ = _run_shell([IP_BIN, "-s", "link", "show"], timeout=10)
+        stats = {}
+        if rc2 == 0:
+            cur = None
+            for line in out2.splitlines():
+                m = re.match(r"\d+:\s+(\S+):", line)
+                if m:
+                    cur = m.group(1).rstrip(":")
+                    stats[cur] = {}
+                    continue
+                m = re.search(r"link/\S+\s+([0-9a-f:]+)", line)
+                if m and cur:
+                    stats[cur]["mac"] = m.group(1)
+                m = re.match(r"\s+RX:\s+bytes\s+packets", line)
+                if m and cur:
+                    stats[cur]["_rx_next"] = True
+                    continue
+                if cur and stats[cur].pop("_rx_next", False):
+                    p = line.split()
+                    if len(p) >= 2:
+                        stats[cur]["rx_bytes"] = int(p[0])
+                        stats[cur]["rx_packets"] = int(p[1])
+                m = re.match(r"\s+TX:\s+bytes\s+packets", line)
+                if m and cur:
+                    stats[cur]["_tx_next"] = True
+                    continue
+                if cur and stats[cur].pop("_tx_next", False):
+                    p = line.split()
+                    if len(p) >= 2:
+                        stats[cur]["tx_bytes"] = int(p[0])
+                        stats[cur]["tx_packets"] = int(p[1])
+        for name, idata in ifaces.items():
+            s = stats.get(name, {})
+            # 流量 human readable
+            def _hr(b):
+                b = b or 0
+                for u in ["B", "KB", "MB", "GB"]:
+                    if b < 1024:
+                        return f"{b:.1f}{u}"
+                    b /= 1024
+                return f"{b:.1f}TB"
+            info["interfaces"].append({
+                "name": name,
+                "ipv4": idata["ipv4"],
+                "ipv6": idata["ipv6"],
+                "mac": s.get("mac", "-"),
+                "rx": _hr(s.get("rx_bytes")),
+                "tx": _hr(s.get("tx_bytes")),
+                "is_default": name == info["default_iface"],
+            })
+    except Exception:
+        pass
+    # DNS (兼容 systemd-resolved stub)
+    info["dns"] = []
+    for _p in ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"]:
+        try:
+            with open(_p) as f:
+                ns = re.findall(r"nameserver\s+(\S+)", f.read())
+                # 过滤 stub (127.0.0.53)
+                ns = [x for x in ns if not x.startswith("127.")]
+                if ns:
+                    info["dns"] = ns[:3]
+                    break
+        except Exception:
+            continue
+    return jsonify(info)
+
+
+def _run_shell(cmd, timeout=10):
+    """供 api_system 用的 shell 执行."""
+    import subprocess
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:
+        return -1, "", str(e)
+
+
+@app.route("/api/account/change", methods=["POST"])
+@requires_auth
+def api_account_change():
+    """
+    修改 Web 登录账户/密码 (v0.5.5).
+    需验证旧密码. 成功后写回 config.yaml, 下次登录生效.
+    """
+    data = request.get_json(force=True) or {}
+    old_pw = data.get("old_password", "")
+    new_user = (data.get("username") or "").strip()
+    new_pw = data.get("new_password", "")
+    w = config.get("web", {})
+    cur_user = w.get("username", "admin")
+    cur_pw = w.get("password", "admin")
+    # 验证旧密码
+    if old_pw != cur_pw:
+        return jsonify({"ok": False, "error": "旧密码不正确"})
+    if not new_user:
+        return jsonify({"ok": False, "error": "用户名不能为空"})
+    if len(new_pw) < 4:
+        return jsonify({"ok": False, "error": "新密码至少 4 位"})
+    # 写回配置
+    if "web" not in config:
+        config["web"] = {}
+    config["web"]["username"] = new_user
+    config["web"]["password"] = new_pw
+    try:
+        save_config()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"保存失败: {e}"})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/data/carrier")
+@requires_auth
+def api_data_carrier():
+    """运营商信息 + APN (自动识别)."""
+    try:
+        m = _get_modem_for_data()
+        try:
+            info = get_carrier_info(m)
+        finally:
+            m.close()
+        # 当前模块内已下发的 APN
+        return jsonify({"ok": True, **info})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/data/apn", methods=["POST"])
+@requires_auth
+def api_data_apn():
+    """手动设置 APN 并下发到模块. body: {"apn": "cbnet"}"""
+    apn = (request.get_json(force=True).get("apn") or "").strip()
+    if not apn:
+        return jsonify({"ok": False, "error": "APN 不能为空"})
+    try:
+        m = _get_modem_for_data()
+        try:
+            ok = provision_apn(m, apn)
+        finally:
+            m.close()
+        if ok:
+            # 同步写回 config (内存 + 文件由调用方持久化)
+            config.setdefault("data", {})["apn"] = apn
+        return jsonify({"ok": ok})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/data/mode")
+@requires_auth
+def api_data_mode():
+    """查询当前 usbnet 模式."""
+    try:
+        m = _get_modem_for_data()
+        try:
+            mode, name = get_usbnet_mode(m)
+        finally:
+            m.close()
+        return jsonify({"ok": True, "mode": mode, "name": name,
+                        "modes": USBNET_MODES})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/data/mode", methods=["POST"])
+@requires_auth
+def api_data_mode_set():
+    """
+    切换 usbnet 模式. body: {"mode": 1}
+    注意: 需重启模块生效, 前端必须二次确认.
+    这里只下发指令, 不自动重启 (返回 need_reboot=True).
+    """
+    try:
+        mode = int(request.get_json(force=True).get("mode"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "mode 必须是 0-3 的整数"})
+    if mode not in USBNET_MODES:
+        return jsonify({"ok": False, "error": "mode 越界"})
+    try:
+        m = _get_modem_for_data()
+        try:
+            ok = set_usbnet_mode(m, mode)
+        finally:
+            m.close()
+        return jsonify({"ok": ok, "need_reboot": True,
+                        "message": "已下发，需 AT+CFUN=1,1 重启生效"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 # ----------------------------------------------------------------------

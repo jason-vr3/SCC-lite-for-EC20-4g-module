@@ -24,9 +24,11 @@ web:
 
 # Cellular data (QMI)
 data:
+  # v0.5.5: 纯 QMI (ECM 已移除, 因 ECM 下语音中断)
   qmi_dev: /dev/cdc-wdm0
-  iface: wwan0
-  apn: ""            # leave empty for auto; e.g. "3gnet", "cmnet"
+  wwan_iface: wwan0
+  apn: ""            # 留空则自动识别 (IMSI->APN库); 如 "cbnet", "cmnet"
+  # IP 类型由代码自动选择 (先 IPv4, 不通再 IPv6), 无需配置
 
 # Notification channels - all disabled by default.
 # Enable and fill in via web UI (通知 tab), or edit here.
