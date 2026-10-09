@@ -11,8 +11,9 @@ echo "==> Installing SCC-lite to $DST"
 mkdir -p "$DST/data"
 cp "$SRC/modem.py" "$SRC/notifications.py" "$SRC/data_control.py" \
    "$SRC/ec20_data.py" "$SRC/at_cheatsheet.py" "$SRC/qq_receiver.py" \
-   "$SRC/scc-lite.py" "$SRC/scc-web.py" "$SRC/requirements.txt" "$DST/"
-[ -f "$DST/config.yaml" ] || cp "$SRC/config.yaml" "$DST/config.yaml"
+   "$SRC/scc-lite.py" "$SRC/scc-web.py" "$SRC/apn_db.py" \
+   "$SRC/apns-conf.xml" "$SRC/requirements.txt" "$DST/"
+[ -f "$DST/config.yaml" ] || cp "$SRC/config.yaml.example" "$DST/config.yaml"
 chmod +x "$DST/scc-lite.py" "$DST/scc-web.py" "$DST/qq_receiver.py"
 
 echo "==> Python dependencies (prefer apt, fallback pip)"
