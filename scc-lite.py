@@ -29,7 +29,7 @@ import sys
 import time
 import yaml
 
-VERSION = "0.5.5"  # 2026-10-08: ECM 数据 + APN 自动识别 + IPv6
+VERSION = "0.5.6"  # v0.5.6: 缓存系统 + USB/Samba + bug修复
 
 from modem import Modem, ModemError, decode_ucs2, is_ucs2_hex
 from notifications import Notifier

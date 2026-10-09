@@ -536,13 +536,18 @@ class DataControl:
 
     # -- 状态 --
     def get_status(self):
-        connected = self.is_connected()
-        ipv4 = self.get_ipv4() if connected else ""
-        ipv6 = self.get_ipv6() if connected else []
+        bearer = self.is_connected()
+        # v0.5.6: 永远返回网卡真实 IP (bearer 断了也显示, 仪表盘与蜂窝页一致).
+        # connected = bearer 已建立 或 网卡上有 IP (有 IP 即视为"已上网",
+        # 允许点"关闭上网"清理; ping 通不通由 check_internet 单独判断).
+        ipv4 = self.get_ipv4()
+        ipv6 = self.get_ipv6()
+        connected = bearer or bool(ipv4) or bool(ipv6)
         return {
             "mode": "qmi",
             "mode_name": "QMI",
             "connected": connected,
+            "bearer": bearer,
             "iface": self.iface,
             "ip_type": self._ip_type,
             "ipv4": ipv4,
@@ -594,14 +599,14 @@ class DataControl:
         result["bearer"] = self.is_connected()
         if self._handle:
             result["bearer_detail"] = f"handle={self._handle}"
-        # 2. IP
-        if result["bearer"]:
-            v4 = self.get_ipv4()
-            v6 = self.get_ipv6()
-            result["ipv4"] = v4
-            result["ipv6"] = v6
-            result["has_ipv4"] = bool(v4)
-            result["has_ipv6"] = bool(v6)
+        # 2. IP (v0.5.6: 不依赖 bearer, 永远读网卡真实地址;
+        #    bearer 断但网卡有 IP 时, 照样显示并允许 ping 测)
+        v4 = self.get_ipv4()
+        v6 = self.get_ipv6()
+        result["ipv4"] = v4
+        result["ipv6"] = v6
+        result["has_ipv4"] = bool(v4)
+        result["has_ipv6"] = bool(v6)
         # 3. 互联网 (两个都测, 各 2 个包快测)
         if result["has_ipv4"]:
             r = self.ping_test("114.114.114.114", count=2, timeout=8)

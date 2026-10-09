@@ -25,7 +25,7 @@ import re
 import sqlite3
 import yaml
 
-VERSION = "0.5.5"
+VERSION = "0.5.6"
 from flask import Flask, request, jsonify, render_template_string, Response
 
 from modem import Modem, ModemError
@@ -108,8 +108,135 @@ def requires_auth(f):
         if not auth or not check_auth(auth.username, auth.password):
             return Response("Login required", 401,
                             {"WWW-Authenticate": 'Basic realm="SCC-lite"'})
+        # v0.5.6: 记录最后活跃时间 (用于缓存系统的有人/无人判断)
+        _cache_touch()
         return f(*args, **kwargs)
     return decorated
+
+
+# ----------------------------------------------------------------------
+# v0.5.6 缓存系统: 内存 dict + 后台刷新线程, 低资源占用
+#
+# 设计:
+# - API 优先返回缓存, 登录/进页面秒开, 不用等 AT/ QMI 扫描
+# - 后台线程按活跃度切换频率: 有人用时勤刷, 无人时懒刷
+# - 各端点独立间隔 (队列式, 非突发):
+#     system: shell 命令, 轻量, 频率最高
+#     data:   qmicli, 中量
+#     device: AT 指令, 最慢且与 scc-lite daemon 抢串口, 频率减半, 错峰执行
+# - "刷新"按钮带 ?fresh=1 强制实时扫描, 绕过缓存
+# - 以下间隔均可按需调整 (秒)
+# ----------------------------------------------------------------------
+CACHE_ACTIVE_INTERVAL = 30    # 有人用时, system/data 刷新间隔 (秒)
+CACHE_IDLE_INTERVAL = 300     # 无人时, system/data 刷新间隔 (秒, 5 分钟)
+CACHE_IDLE_TIMEOUT = 300      # N 秒无认证请求则判无人 (5 分钟)
+# device (AT 扫描) 独立间隔: 比上面减半频率, 减少串口争用
+CACHE_DEVICE_ACTIVE = 60      # 有人用时, device 刷新间隔 (秒)
+CACHE_DEVICE_IDLE = 600       # 无人时, device 刷新间隔 (秒, 10 分钟)
+
+_cache = {}                   # key -> {"ts": float, "data": dict}
+_cache_last_active = 0.0      # 最后认证请求时间戳
+_cache_lock = None            # 延迟初始化 threading.Lock
+_cache_thread = None
+
+
+def _cache_lock_get():
+    global _cache_lock
+    if _cache_lock is None:
+        import threading
+        _cache_lock = threading.Lock()
+    return _cache_lock
+
+
+def _cache_touch():
+    """记录活跃时间 (每次认证 API 调用)."""
+    global _cache_last_active
+    _cache_last_active = __import__("time").time()
+
+
+def _cache_is_active():
+    """5 分钟内有请求则算有人."""
+    import time
+    return (time.time() - _cache_last_active) < CACHE_IDLE_TIMEOUT
+
+
+def _cache_get(key):
+    with _cache_lock_get():
+        e = _cache.get(key)
+        return e["data"] if e else None
+
+
+def _cache_set(key, data):
+    import time
+    with _cache_lock_get():
+        _cache[key] = {"ts": time.time(), "data": data}
+
+
+def _cache_invalidate(key=None):
+    """清缓存 (key=None 则全清)."""
+    with _cache_lock_get():
+        if key:
+            _cache.pop(key, None)
+        else:
+            _cache.clear()
+
+
+def _cache_refresh_all():
+    """后台刷新: 队列式, 各端点按独立间隔错峰更新, 单项失败不影响其他."""
+    import logging
+    import time
+    log = logging.getLogger("scc-lite.web")
+    active = _cache_is_active()
+    now = time.time()
+    # (key, 扫描函数, 活跃间隔, 空闲间隔)
+    jobs = (
+        ("system", _scan_system, CACHE_ACTIVE_INTERVAL, CACHE_IDLE_INTERVAL),
+        ("data", _scan_data, CACHE_ACTIVE_INTERVAL, CACHE_IDLE_INTERVAL),
+        ("device", _scan_device, CACHE_DEVICE_ACTIVE, CACHE_DEVICE_IDLE),
+    )
+    for key, fn, int_active, int_idle in jobs:
+        interval = int_active if active else int_idle
+        with _cache_lock_get():
+            ts = _cache.get(key, {}).get("ts", 0)
+        if now - ts < interval:
+            continue  # 还没到该端点的刷新时间, 跳过 (错峰)
+        try:
+            _cache_set(key, fn())
+        except Exception as e:
+            log.warning("cache refresh %s failed: %s", key, e)
+
+
+def _cache_loop():
+    """后台线程: 短周期 tick, 由各端点独立间隔决定是否真刷 (队列式错峰)."""
+    import time
+    import logging
+    log = logging.getLogger("scc-lite.web")
+    log.info("cache thread started (tick=10s, system/data active=%ds idle=%ds, "
+             "device active=%ds idle=%ds)",
+             CACHE_ACTIVE_INTERVAL, CACHE_IDLE_INTERVAL,
+             CACHE_DEVICE_ACTIVE, CACHE_DEVICE_IDLE)
+    while True:
+        time.sleep(10)  # tick 固定 10 秒, 轻量; 真正刷不刷由各端点间隔决定
+        try:
+            _cache_refresh_all()
+        except Exception as e:
+            log.warning("cache loop error: %s", e)
+
+
+def _cache_start():
+    """启动后台刷新线程 (daemon, 随主进程退出)."""
+    global _cache_thread
+    if _cache_thread and _cache_thread.is_alive():
+        return
+    import threading
+    # 启动时先刷一次, 让登录进来就有数据
+    try:
+        _cache_refresh_all()
+    except Exception:
+        pass
+    _cache_thread = threading.Thread(target=_cache_loop, daemon=True,
+                                     name="scc-cache")
+    _cache_thread.start()
 
 
 # ----------------------------------------------------------------------
@@ -196,7 +323,7 @@ label{font-size:13px;color:var(--muted)}
 </style></head>
 <body>
 <aside class="sidebar">
-<div class="logo">📡 SCC-lite<small>SMS Control Centre v0.5.5</small></div>
+<div class="logo">📡 SCC-lite<small>SMS Control Centre v{{ version }}</small></div>
 <nav id="tabs">
 <button data-t="dash" class="active"><span class="ico">📊</span><span class="txt">仪表盘</span></button>
 <button data-t="sms"><span class="ico">💬</span><span class="txt">短信中心</span></button>
@@ -234,11 +361,17 @@ label{font-size:13px;color:var(--muted)}
 <div class="stat"><div class="num" id="st-sms">-</div><div class="lbl">短信总数</div></div>
 <div class="stat"><div class="num" id="st-data">-</div><div class="lbl">蜂窝网络</div></div>
 </div>
-<div class="card"><h2>本地设备信息 <button class="btn ghost" onclick="loadDashSys()">刷新</button></h2>
+<div style="display:flex;gap:14px;flex-wrap:wrap">
+<div class="card" style="flex:1;min-width:280px"><h2>本地设备信息 <button class="btn ghost" onclick="loadDashSys(1)">刷新</button></h2>
 <div id="dash-sys">加载中…</div></div>
-<div class="card"><h2>4G 模块 <button class="btn ghost" onclick="loadDashModem()">刷新</button></h2>
+<div class="card" style="flex:1;min-width:280px"><h2>4G 模块 <button class="btn ghost" onclick="loadDashModem()">刷新</button></h2>
 <div id="dash-modem">加载中…</div>
 <p class="muted">点击模块可跳转到设备管理页查看详情</p></div>
+<div class="card" style="flex:1;min-width:280px"><h2>💾 USB 外接设备 <button class="btn ghost" onclick="loadUsb()">刷新</button></h2>
+<div id="samba-status" style="font-size:12px;color:var(--muted);margin-bottom:6px">Samba 状态: 检查中…</div>
+<div id="usb-list" style="font-size:13px">加载中…</div>
+<div style="margin-top:8px;font-size:12px;color:var(--muted)">💡 挂载后点"创建Samba共享"，PC 用 Web 登录的账密访问共享，文件互传。</div></div>
+</div>
 </section>
 <!-- SMS (iOS style) -->
 <section id="t-sms" class="hidden">
@@ -291,7 +424,7 @@ label{font-size:13px;color:var(--muted)}
 <!-- Device -->
 <section id="t-device" class="hidden">
 <h1 class="page-title">设备管理</h1><p class="page-sub">模组状态与射频控制</p>
-<div class="card"><h2>设备状态 <button class="btn ghost" onclick="loadDevice()">刷新</button></h2>
+<div class="card"><h2>设备状态 <button class="btn ghost" onclick="loadDevice(1)">刷新</button></h2>
 <div id="device-info">加载中…</div></div>
 <div class="card"><h2>飞行模式</h2>
 <div class="row"><span id="flight-status">未知</span>
@@ -301,7 +434,7 @@ label{font-size:13px;color:var(--muted)}
 <!-- Data -->
 <section id="t-data" class="hidden">
 <h1 class="page-title">蜂窝网络</h1><p class="page-sub">QMI 数据连接管理 (v0.5.5 纯 QMI)</p>
-<div class="card"><h2>数据连接 <button class="btn ghost" onclick="loadData()">刷新</button></h2>
+<div class="card"><h2>数据连接 <button class="btn ghost" onclick="loadData(1)">刷新</button></h2>
 <div id="data-info">加载中…</div>
 <div id="data-stages" style="margin-top:12px"></div>
 <div class="row" style="margin-top:8px">
@@ -398,10 +531,10 @@ async function loadDash(){const [dev,sms,data]=await Promise.all([api('/api/devi
   const rs={0:'未注册',1:'已注册',2:'搜索中',3:'被拒',5:'漫游'};$('st-reg').textContent=rs[dev.reg?.stat]??'-';}
  if(sms)$('st-sms').textContent=sms.messages.length;
  if(data)$('st-data').textContent=data.connected?((data.ipv6&&data.ipv6[0])||data.ip||'已连接'):'未连接';
- loadDashSys();loadDashModem();}
+ loadDashSys();loadDashModem();loadUsb();}
 function bar(pct){const c=pct>80?'#e53935':(pct>60?'#fb8c00':'#8bc34a');
  return `<div style="background:#eee;border-radius:4px;height:8px;flex:1"><div style="background:${c};height:8px;border-radius:4px;width:${Math.min(pct,100)}%"></div></div>`;}
-async function loadDashSys(){const d=await api('/api/system');if(!d)return;
+async function loadDashSys(fresh){const d=await api('/api/system'+(fresh?'?fresh=1':''));if(!d)return;
  const ifs=d.interfaces||[];
  const defIf=ifs.find(i=>i.is_default)||ifs.find(i=>i.name!=='lo')||{};
  const defIp=[...(defIf.ipv4||[]),...(defIf.ipv6||[])].join('<br>')||'-';
@@ -423,8 +556,38 @@ async function loadDashSys(){const d=await api('/api/system');if(!d)return;
  <dt>运行时间</dt><dd>${esc(d.uptime||'-')}</dd>
  <dt>负载</dt><dd>${(d.loadavg||[]).join(' ')||'-'}</dd></dl>
  <div style="margin-top:8px"><a href="javascript:void(0)" onclick="toggleIfs()" style="font-size:13px">展开所有网卡 (${ifs.filter(i=>i.name!=='lo').length}) ▾</a>
- <div id="ifs-detail" style="display:none;margin-top:4px">${allIfs}</div></div>`;}
+ <div id="ifs-detail" style="display:none;margin-top:4px">${allIfs}</div></div>
+`;}
 function toggleIfs(){const b=$('ifs-detail');b.style.display=b.style.display==='none'?'block':'none';}
+// USB 管理 (v0.5.6)
+async function loadUsb(){
+ const smb=await api('/api/system/samba/status');
+ if(smb){$('samba-status').innerHTML='Samba 状态: '+(smb.installed?(smb.running?'<span class="badge ok">运行中</span>':'<span class="badge bad">未运行</span>'):'<span style="color:#999">未安装 (sudo bash install.sh)</span>');}
+ const d=await api('/api/system/usb');if(!d)return;
+ const devs=d.devices||[];
+ if(!devs.length){$('usb-list').innerHTML='未检测到 USB 存储设备';return;}
+ const shares={};(smb&&smb.shares||[]).forEach(x=>shares[x.path]=x.name);
+ $('usb-list').innerHTML=devs.map(v=>{
+  const mp=v.mountpoint;
+  const sh=mp?shares[mp]:null;
+  let btn='';
+  if(!mp)btn=`<button class="btn" style="font-size:12px;padding:2px 8px" onclick="usbMount('${esc(v.dev)}')">挂载</button>`;
+  else btn=`<button class="btn ghost" style="font-size:12px;padding:2px 8px" onclick="usbUmount('${esc(v.dev)}')">卸载</button>`;
+  let smb='';
+  if(mp&&!sh)smb=` <button class="btn ghost" style="font-size:12px;padding:2px 8px" onclick="sambaShare('${esc(mp)}')">创建Samba共享</button>`;
+  if(sh)smb=` <span class="badge ok">已共享: ${esc(sh)}</span>`;
+  return `<div style="padding:6px 0;border-bottom:1px solid var(--border)">
+   <b>${esc(v.label||v.name)}</b> <span style="color:var(--muted)">${esc(v.dev)} · ${esc(v.size)} · ${esc(v.fstype||'?')}</span><br>
+   <span style="color:var(--muted)">${mp?'挂载点: '+esc(mp):'未挂载'}</span><br>${btn}${smb}</div>`;
+ }).join('');
+}
+async function usbMount(dev){const d=await api('/api/system/usb/mount',{method:'POST',body:JSON.stringify({dev})});
+ if(d&&d.ok)loadUsb();else alert('挂载失败: '+(d&&d.error||'未知'));}
+async function usbUmount(dev){if(!confirm('卸载将同时删除其 Samba 共享，确定？'))return;
+ const d=await api('/api/system/usb/umount',{method:'POST',body:JSON.stringify({dev})});
+ if(d&&d.ok)loadUsb();else alert('卸载失败: '+(d&&d.error||'未知'));}
+async function sambaShare(path){const d=await api('/api/system/samba/share',{method:'POST',body:JSON.stringify({path})});
+ if(d&&d.ok){alert('共享已创建！\n'+d.hint);loadUsb();}else alert('创建失败: '+(d&&d.error||'未知'));}
 async function loadDashModem(){const d=await api('/api/device');if(!d)return;
  const rs={0:'未注册',1:'已注册(本地)',2:'搜索中',3:'被拒绝',5:'已注册(漫游)'}[d.reg?.stat]??'-';
  $('dash-modem').innerHTML=`<div onclick="goTab('device')" style="cursor:pointer"><dl class="kv">
@@ -512,7 +675,7 @@ async function sendSms(){const to=(currentContact||$('sms-to').value.trim()),tex
  const d=await api('/api/sms/send',{method:'POST',body:JSON.stringify({to,text})});
  $('sms-send-status').textContent=d&&d.ok?'✅ 已发送':'❌ '+(d&&d.error||'失败');
  if(d&&d.ok){$('sms-text').value='';$('sms-text').style.height='auto';currentContact=to;setTimeout(loadSms,1000);}}
-async function loadDevice(){const d=await api('/api/device');if(!d)return;
+async function loadDevice(fresh){const d=await api('/api/device'+(fresh?'?fresh=1':''));if(!d)return;
  const r=d.reg||{};const regTxt={0:'未注册',1:'已注册(本地)',2:'搜索中',3:'被拒绝',5:'已注册(漫游)'}[r.stat]??('stat='+r.stat);
  $('device-info').innerHTML=`<dl class="kv">
  <dt>IMEI</dt><dd>${esc(d.imei)}</dd><dt>IMSI</dt><dd>${esc(d.imsi)}</dd>
@@ -531,7 +694,7 @@ async function savePort(){const p=$('port-input').value.trim();if(!p)return aler
  alert(d&&d.ok?('已保存: '+d.port+'，'+(d.note||'')):'失败: '+(d&&d.error));loadDevice();}
 async function setFlight(on){const d=await api('/api/device/flight',{method:'POST',body:JSON.stringify({enable:on})});
  alert(d&&d.ok?'已执行，等待 modem 生效':'失败: '+(d&&d.error));loadDevice();}
-async function loadData(){const d=await api('/api/data');if(!d)return;
+async function loadData(fresh){const d=await api('/api/data'+(fresh?'?fresh=1':''));if(!d)return;
  const v6=(d.ipv6||[]).map(esc).join('<br>')||'-';
  const ipChg=d.ip_changed?`<div style="margin-top:8px;padding:8px;background:#fff8e1;border-radius:4px;font-size:13px">⚠️ IP 发生变化: ${esc(d.ip_change_msg||'')}<button class="btn ghost" style="margin-left:8px" onclick="clearIpChange()">知道了</button></div>`:'';
  $('data-info').innerHTML=`<dl class="kv">
@@ -577,7 +740,7 @@ async function submitAccountChange(){
  const d=await api('/api/account/change',{method:'POST',body:JSON.stringify({
   username:$('acc-username').value.trim(),
   old_password:$('acc-oldpw').value,new_password:npw})});
- if(d&&d.ok){alert('已保存，下次登录生效');closeAccountModal();}
+ if(d&&d.ok){alert(d.msg||'已保存，请重新登录');location.href='/logout';}
  else{$('acc-msg').textContent=d&&(d.error||'失败');}}
 async function dataOff(){if(!confirm('关闭上网将断开 PDP（省电），确定？'))return;
  const d=await api('/api/data/off',{method:'POST'});
@@ -707,7 +870,7 @@ loadDash();
 @app.route("/")
 @requires_auth
 def index():
-    return render_template_string(PAGE)
+    return render_template_string(PAGE, version=VERSION)
 
 
 @app.route("/logout")
@@ -792,9 +955,8 @@ def api_sms_send():
 # ----------------------------------------------------------------------
 # Device API
 # ----------------------------------------------------------------------
-@app.route("/api/device")
-@requires_auth
-def api_device():
+def _scan_device():
+    """实时扫描设备信息 (AT 指令, 慢, 供缓存系统调用)."""
     info = {"port": config.get("modem", {}).get("port", "")}
     try:
         m = get_modem()
@@ -813,7 +975,22 @@ def api_device():
             m.close()
     except ModemError as e:
         info["error"] = str(e)
-    return jsonify(info)
+    return info
+
+
+@app.route("/api/device")
+@requires_auth
+def api_device():
+    # v0.5.6: ?fresh=1 强制实时扫描, 否则返回缓存秒回
+    if request.args.get("fresh") == "1":
+        data = _scan_device()
+        _cache_set("device", data)
+        return jsonify(data)
+    data = _cache_get("device")
+    if data is None:
+        data = _scan_device()
+        _cache_set("device", data)
+    return jsonify(data)
 
 
 @app.route("/api/device/flight", methods=["POST"])
@@ -834,10 +1011,24 @@ def api_flight():
 # ----------------------------------------------------------------------
 # Data API
 # ----------------------------------------------------------------------
+def _scan_data():
+    """实时扫描数据状态 (QMI, 供缓存系统调用)."""
+    return get_data_ctl().get_status()
+
+
 @app.route("/api/data")
 @requires_auth
 def api_data():
-    return jsonify(get_data_ctl().get_status())
+    # v0.5.6: ?fresh=1 强制实时扫描, 否则返回缓存秒回
+    if request.args.get("fresh") == "1":
+        data = _scan_data()
+        _cache_set("data", data)
+        return jsonify(data)
+    data = _cache_get("data")
+    if data is None:
+        data = _scan_data()
+        _cache_set("data", data)
+    return jsonify(data)
 
 
 @app.route("/api/data/on", methods=["POST"])
@@ -944,9 +1135,9 @@ def api_account_info():
 
 @app.route("/api/system")
 @requires_auth
-def api_system():
+def _scan_system():
     """
-    本机系统信息 (v0.5.5 仪表盘用):
+    本机系统信息 (v0.5.5/v0.5.6 仪表盘用):
     CPU/内存/磁盘/网卡/IP/DNS/网关/运行时间/负载.
     """
     import shutil
@@ -1127,6 +1318,21 @@ def api_system():
     return jsonify(info)
 
 
+
+@app.route("/api/system")
+@requires_auth
+def api_system():
+    """本机系统信息 (缓存版, ?fresh=1 强制实时)."""
+    if request.args.get("fresh") == "1":
+        data = _scan_system()
+        _cache_set("system", data)
+        return jsonify(data)
+    data = _cache_get("system")
+    if data is None:
+        data = _scan_system()
+        _cache_set("system", data)
+    return jsonify(data)
+
 def _run_shell(cmd, timeout=10):
     """供 api_system 用的 shell 执行."""
     import subprocess
@@ -1137,12 +1343,324 @@ def _run_shell(cmd, timeout=10):
         return -1, "", str(e)
 
 
+# ----------------------------------------------------------------------
+# Samba 共享管理 (v0.5.6): 状态 / 创建共享 / 密码同步
+# 共享定义写 /etc/samba/scc-lite-shares.conf (include 方式, 不污染 smb.conf)
+# 账密与 Web 登录同一套, 创建共享时自动同步
+# ----------------------------------------------------------------------
+SAMBA_SHARES_CONF = "/etc/samba/scc-lite-shares.conf"
+SAMBA_SMB_CONF = "/etc/samba/smb.conf"
+
+
+def _samba_installed():
+    import shutil
+    return bool(shutil.which("smbd") or shutil.which("samba"))
+
+
+def _samba_running():
+    rc, out, _ = _run_shell(["systemctl", "is-active", "smbd"], timeout=10)
+    if out.strip() == "active":
+        return True
+    rc, out, _ = _run_shell(["systemctl", "is-active", "samba"], timeout=10)
+    return out.strip() == "active"
+
+
+def _samba_ensure_include():
+    """确保 smb.conf 包含我们的共享文件."""
+    try:
+        with open(SAMBA_SMB_CONF) as f:
+            content = f.read()
+    except Exception:
+        return False
+    inc = f"include = {SAMBA_SHARES_CONF}"
+    if SAMBA_SHARES_CONF in content:
+        return True
+    try:
+        with open(SAMBA_SMB_CONF, "a") as f:
+            f.write(f"\n# SCC-lite USB shares (v0.5.6)\n{inc}\n")
+        return True
+    except Exception:
+        return False
+
+
+def _samba_read_shares():
+    """解析我们的共享文件, 返回 {share_name: path}."""
+    shares = {}
+    try:
+        with open(SAMBA_SHARES_CONF) as f:
+            content = f.read()
+    except Exception:
+        return shares
+    import re
+    cur = None
+    for line in content.splitlines():
+        m = re.match(r"\[(.+)\]", line.strip())
+        if m:
+            cur = m.group(1)
+            shares[cur] = ""
+        elif cur and line.strip().lower().startswith("path"):
+            pm = re.match(r"path\s*=\s*(.+)", line.strip(), re.I)
+            if pm:
+                shares[cur] = pm.group(1).strip()
+    return shares
+
+
+def _samba_write_shares(shares):
+    """重写共享文件. shares: {name: (path, user)}"""
+    lines = ["# SCC-lite USB shares (v0.5.6, 自动生成, 请勿手改)\n"]
+    for name, (path, user) in shares.items():
+        lines.append(f"[{name}]\n")
+        lines.append(f"    path = {path}\n")
+        lines.append("    browseable = yes\n")
+        lines.append("    read only = no\n")
+        lines.append(f"    valid users = {user}\n")
+        lines.append("    create mask = 0644\n")
+        lines.append("    directory mask = 0755\n")
+        lines.append("\n")
+    with open(SAMBA_SHARES_CONF, "w") as f:
+        f.writelines(lines)
+
+
+def _samba_reload():
+    _run_shell(["systemctl", "reload", "smbd"], timeout=15)
+    _run_shell(["systemctl", "reload", "samba"], timeout=15)
+
+
+def _samba_remove_share_for_path(mp):
+    """按挂载点删除共享 (卸载 U 盘时调用)."""
+    shares = _samba_read_shares()
+    # 需要 user 信息, 从现有文件解析太麻烦, 直接按 path 匹配删除整段
+    import re
+    try:
+        with open(SAMBA_SHARES_CONF) as f:
+            content = f.read()
+    except Exception:
+        return
+    # 按 [name] 段切分, 删掉 path 匹配的段
+    parts = re.split(r"(?m)^\[(.+)\]\s*$", content)
+    # parts[0] 是头部注释, 之后每两项一组 (name, body)
+    out = [parts[0]]
+    for i in range(1, len(parts), 2):
+        name = parts[i]
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        m = re.search(r"(?m)^\s*path\s*=\s*(.+)\s*$", body)
+        if m and m.group(1).strip() == mp:
+            continue  # 删掉这个段
+        out.append(f"[{name}]\n")
+        out.append(body)
+    with open(SAMBA_SHARES_CONF, "w") as f:
+        f.write("".join(out))
+    _samba_reload()
+
+
+def _samba_sync_password(username, password):
+    """把 Web 账密同步到 Samba (smbpasswd). 返回 (ok, msg)."""
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", username):
+        return False, "用户名非法"
+    if not _samba_installed():
+        return False, "Samba 未安装"
+    # -a 添加用户 (已存在则更新密码), -s 静默从 stdin 读
+    import subprocess
+    try:
+        p = subprocess.run(
+            ["smbpasswd", "-a", "-s", username],
+            input=f"{password}\n{password}\n",
+            capture_output=True, text=True, timeout=15)
+        if p.returncode != 0:
+            return False, p.stderr.strip()[:200] or "smbpasswd 失败"
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+@app.route("/api/system/samba/status")
+@requires_auth
+def api_samba_status():
+    """Samba 状态: 装没装 / 跑没跑 / 共享列表."""
+    shares = _samba_read_shares()
+    return jsonify({
+        "installed": _samba_installed(),
+        "running": _samba_running(),
+        "shares": [{"name": n, "path": p} for n, p in shares.items()],
+    })
+
+
+@app.route("/api/system/samba/share", methods=["POST"])
+@requires_auth
+def api_samba_share():
+    """
+    为已挂载的 USB 创建 Samba 共享.
+    参数: {"path": "/mnt/usb-BACKUP"}
+    共享名=卷标 (无卷标则 usbshare), 账密=Web 登录账密.
+    """
+    import re
+    import os
+    data = request.get_json(force=True, silent=True) or {}
+    path = (data.get("path") or "").strip()
+    if not re.fullmatch(r"/mnt/usb-[A-Za-z0-9_-]+", path):
+        return jsonify({"ok": False, "error": "路径非法"})
+    if not os.path.isdir(path):
+        return jsonify({"ok": False, "error": "目录不存在"})
+    if not _samba_installed():
+        return jsonify({"ok": False, "error": "Samba 未安装, 请先 sudo bash install.sh"})
+    # 共享名: 卷标, 无卷标用 usbshare (重名则加序号)
+    base = path.replace("/mnt/usb-", "")
+    name = re.sub(r"[^A-Za-z0-9_-]", "_", base) or "usbshare"
+    shares = _samba_read_shares()
+    if name in shares:
+        i = 2
+        while f"{name}{i}" in shares:
+            i += 1
+        name = f"{name}{i}"
+    # Web 账密
+    w = config.get("web", {})
+    user = w.get("username", "admin")
+    pw = w.get("password", "admin")
+    # 同步 Samba 密码
+    ok, msg = _samba_sync_password(user, pw)
+    if not ok:
+        return jsonify({"ok": False, "error": f"Samba 密码同步失败: {msg}"})
+    # 写共享
+    _samba_ensure_include()
+    # 读出现有 (带 user), 重新构造
+    full = {}
+    for n, p in shares.items():
+        full[n] = (p, user)  # user 统一用当前 Web 用户
+    full[name] = (path, user)
+    try:
+        _samba_write_shares(full)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"写共享配置失败: {e}"})
+    _samba_reload()
+    # 本机 IP (给指引用)
+    rc, out, _ = _run_shell(["hostname", "-I"], timeout=10)
+    ip = out.strip().split()[0] if out.strip() else "<N1-IP>"
+    return jsonify({
+        "ok": True,
+        "share": name,
+        "path": path,
+        "user": user,
+        "hint": f"请用 Web 登录的账密访问: \\\\{ip}\\{name}",
+    })
+# ----------------------------------------------------------------------
+# USB 存储管理 (v0.5.6): 列设备 / 挂载 / 卸载
+# 安全: 只操作 TRAN=usb 的设备, 设备路径严格校验, 不碰系统盘
+# ----------------------------------------------------------------------
+def _usb_list():
+    """列出 USB 存储设备 (lsblk JSON)."""
+    import json
+    import re
+    rc, out, _ = _run_shell(
+        ["lsblk", "-J", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,LABEL,FSTYPE,TRAN"],
+        timeout=10)
+    devs = []
+    if rc != 0:
+        return devs
+    try:
+        data = json.loads(out)
+    except Exception:
+        return devs
+    for blk in data.get("blockdevices", []):
+        # 只收 USB 设备 (整盘或分区)
+        is_usb = (blk.get("tran") == "usb")
+        children = []
+        for ch in blk.get("children", []):
+            if ch.get("tran") == "usb" or is_usb:
+                children.append(ch)
+        targets = [blk] if is_usb and not children else children
+        for t in targets:
+            if t.get("type") not in ("part", "disk"):
+                continue
+            name = t.get("name", "")
+            # 严格校验设备名, 防路径穿越
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+                continue
+            devs.append({
+                "dev": f"/dev/{name}",
+                "name": name,
+                "size": t.get("size", ""),
+                "type": t.get("type", ""),
+                "label": t.get("label") or "",
+                "fstype": t.get("fstype") or "",
+                "mountpoint": t.get("mountpoint") or "",
+            })
+    return devs
+
+
+def _usb_mountpoint(label, dev):
+    """挂载点: /mnt/usb-<卷标>, 无卷标用设备名."""
+    import re
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", label) if label else ""
+    if not safe:
+        safe = re.sub(r"[^A-Za-z0-9_-]", "_", dev.replace("/dev/", ""))
+    return f"/mnt/usb-{safe}"
+
+
+@app.route("/api/system/usb")
+@requires_auth
+def api_usb_list():
+    """USB 存储设备列表."""
+    return jsonify({"devices": _usb_list()})
+
+
+@app.route("/api/system/usb/mount", methods=["POST"])
+@requires_auth
+def api_usb_mount():
+    """挂载 USB 设备. 参数: {"dev": "/dev/sda1"}"""
+    import os
+    import re
+    data = request.get_json(force=True, silent=True) or {}
+    dev = (data.get("dev") or "").strip()
+    # 严格校验: 只允许 /dev/sdX /dev/nvmeXnYpZ 等块设备名
+    if not re.fullmatch(r"/dev/[a-zA-Z0-9_-]+", dev):
+        return jsonify({"ok": False, "error": "设备路径非法"})
+    # 确认是 USB 设备
+    found = [d for d in _usb_list() if d["dev"] == dev]
+    if not found:
+        return jsonify({"ok": False, "error": "非 USB 存储设备, 拒绝挂载"})
+    info = found[0]
+    if info["mountpoint"]:
+        return jsonify({"ok": True, "mountpoint": info["mountpoint"],
+                        "msg": "已挂载"})
+    mp = _usb_mountpoint(info["label"], dev)
+    os.makedirs(mp, exist_ok=True)
+    rc, _, err = _run_shell(["mount", dev, mp], timeout=30)
+    if rc != 0:
+        return jsonify({"ok": False, "error": f"挂载失败: {err.strip()[:200]}"})
+    return jsonify({"ok": True, "mountpoint": mp})
+
+
+@app.route("/api/system/usb/umount", methods=["POST"])
+@requires_auth
+def api_usb_umount():
+    """卸载 USB 设备, 同时删除其 Samba 共享. 参数: {"dev": "/dev/sda1"}"""
+    import re
+    data = request.get_json(force=True, silent=True) or {}
+    dev = (data.get("dev") or "").strip()
+    if not re.fullmatch(r"/dev/[a-zA-Z0-9_-]+", dev):
+        return jsonify({"ok": False, "error": "设备路径非法"})
+    found = [d for d in _usb_list() if d["dev"] == dev]
+    mp = found[0]["mountpoint"] if found else ""
+    if not mp:
+        return jsonify({"ok": False, "error": "设备未挂载"})
+    # 先删 Samba 共享 (如果有)
+    try:
+        _samba_remove_share_for_path(mp)
+    except Exception:
+        pass
+    rc, _, err = _run_shell(["umount", mp], timeout=30)
+    if rc != 0:
+        return jsonify({"ok": False, "error": f"卸载失败: {err.strip()[:200]}"})
+    return jsonify({"ok": True})
+
+
 @app.route("/api/account/change", methods=["POST"])
 @requires_auth
 def api_account_change():
     """
-    修改 Web 登录账户/密码 (v0.5.5).
-    需验证旧密码. 成功后写回 config.yaml, 下次登录生效.
+    修改 Web 登录账户/密码 (v0.5.5, v0.5.6 增强).
+    需验证旧密码. 成功后写回 config.yaml, 同步 Samba 密码, 前端强制登出重登.
     """
     data = request.get_json(force=True) or {}
     old_pw = data.get("old_password", "")
@@ -1167,7 +1685,32 @@ def api_account_change():
         save_config()
     except Exception as e:
         return jsonify({"ok": False, "error": f"保存失败: {e}"})
-    return jsonify({"ok": True})
+    # v0.5.6: 同步 Samba 密码 (用户名变了则删旧建新)
+    samba_msg = ""
+    if _samba_installed():
+        try:
+            if new_user != cur_user:
+                # 删旧 Samba 用户
+                _run_shell(["smbpasswd", "-x", cur_user], timeout=15)
+            ok, msg = _samba_sync_password(new_user, new_pw)
+            if not ok:
+                samba_msg = f" (Samba 密码同步失败: {msg})"
+            else:
+                # 用户名变了, 更新共享文件中的 valid users
+                shares = _samba_read_shares()
+                if shares:
+                    full = {n: (p, new_user) for n, p in shares.items()}
+                    try:
+                        _samba_write_shares(full)
+                        _samba_reload()
+                    except Exception:
+                        pass
+        except Exception as e:
+            samba_msg = f" (Samba 同步异常: {e})"
+    # 清 API 缓存 (账密变了, 旧缓存无意义)
+    _cache_invalidate()
+    return jsonify({"ok": True, "samba_msg": samba_msg,
+                    "msg": f"已保存{samba_msg}, 请重新登录"})
 
 
 @app.route("/api/data/carrier")
@@ -1506,6 +2049,11 @@ def main():
     w = config.get("web", {})
     port = w.get("port", 7577)
     log.info("SCC-lite web on :%d", port)
+    # v0.5.6: 启动 API 缓存后台线程
+    try:
+        _cache_start()
+    except Exception as e:
+        log.warning("cache thread start failed: %s", e)
     app.run(host="0.0.0.0", port=port, threaded=True)
 
 
