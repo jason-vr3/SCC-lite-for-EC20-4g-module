@@ -55,8 +55,10 @@ def get_usbnet_mode(modem):
     实机验证: AT+QCFG="usbnet" -> +QCFG: "usbnet",1
     """
     try:
-        resp = modem.raw('AT+QCFG="usbnet"')
-        m = re.search(r'"usbnet",(\d)', resp)
+        # modem.raw() 返回 (lines, ok), lines 是响应行列表
+        resp, ok = modem.raw('AT+QCFG="usbnet"')
+        resp_str = "\n".join(resp) if isinstance(resp, list) else str(resp)
+        m = re.search(r'"usbnet",(\d)', resp_str)
         if m:
             mode = int(m.group(1))
             return mode, USBNET_MODES.get(mode, f"未知({mode})")
@@ -74,8 +76,8 @@ def set_usbnet_mode(modem, mode):
     if mode not in USBNET_MODES:
         return False
     try:
-        resp = modem.raw(f'AT+QCFG="usbnet",{mode}')
-        return "OK" in resp
+        resp, ok = modem.raw(f'AT+QCFG="usbnet",{mode}')
+        return ok
     except Exception as e:
         log.warning("set_usbnet_mode failed: %s", e)
         return False
@@ -124,8 +126,8 @@ def provision_apn(modem, apn, pdp_type="IPV4V6"):
         if not re.fullmatch(r"[A-Za-z0-9._-]+", apn):
             log.warning("非法 APN: %s", apn)
             return False
-        resp = modem.raw(f'AT+CGDCONT=1,"{pdp_type}","{apn}"')
-        return "OK" in resp
+        resp, ok = modem.raw(f'AT+CGDCONT=1,"{pdp_type}","{apn}"')
+        return ok
     except Exception as e:
         log.warning("provision_apn failed: %s", e)
         return False
