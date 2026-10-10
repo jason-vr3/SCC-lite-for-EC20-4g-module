@@ -29,7 +29,7 @@ import sys
 import time
 import yaml
 
-VERSION = "0.5.6"  # v0.5.6: 缓存系统 + USB/Samba + bug修复
+VERSION = "0.5.7"  # v0.5.7: APN 自动识别+自动应用, data_path bug 修复
 
 from modem import Modem, ModemError, decode_ucs2, is_ucs2_hex
 from notifications import Notifier
@@ -209,6 +209,7 @@ class Daemon:
 
         data_path = config.get("data_dir", "/opt/scc-lite-for-EC20-4g-module/data")
         os.makedirs(data_path, exist_ok=True)
+        self.data_path = data_path  # v0.5.7: 存为实例属性, 供其他方法使用
         self.store = Store(os.path.join(data_path, "scc-lite.db"))
         self.notifier = Notifier(config.get("notifications", {}))
 
@@ -354,7 +355,7 @@ class Daemon:
                 import qq_receiver
                 # openid 存到 data_dir，和 SQLite 放一起
                 qq_receiver.set_openid_file(
-                    os.path.join(data_path, "qq_openids.json"))
+                    os.path.join(self.data_path, "qq_openids.json"))
                 bot = QQBot(qq_cfg.get("app_id"), qq_cfg.get("app_secret"), "")
                 receiver = QQReceiver(qq_cfg.get("app_id"), qq_cfg.get("app_secret"),
                                       bot._get_token)

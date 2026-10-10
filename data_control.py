@@ -40,9 +40,53 @@ def _run(cmd, timeout=30):
                            timeout=timeout)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
+        # v0.5.7: 超时后强制杀残留进程, 避免 qmicli 卡死占住 QMI
+        try:
+            if cmd and cmd[0] == "qmicli":
+                subprocess.run(["pkill", "-9", "qmicli"],
+                               capture_output=True, timeout=5)
+        except Exception:
+            pass
         return -1, "", "timeout"
     except FileNotFoundError as e:
         return -2, "", f"command not found: {e}"
+
+
+def _qmi_run(cmd, timeout=30, retries=2):
+    """
+    v0.5.7: 健壮的 qmicli 执行器.
+    QMI 接口偶发卡死, 失败时自动 pkill + wds-reset 后重试.
+    返回 (returncode, stdout, stderr). 全部重试失败返回最后一次结果.
+    """
+    last = (-1, "", "not run")
+    for attempt in range(retries + 1):
+        rc, out, err = _run(cmd, timeout=timeout)
+        if rc == 0:
+            return rc, out, err
+        last = (rc, out, err)
+        if attempt < retries:
+            log.warning("qmicli 失败 (尝试 %d/%d): %s, 重置 QMI 后重试",
+                        attempt + 1, retries + 1, (err or out)[:100])
+            # 杀残留 + 重置 WDS
+            try:
+                subprocess.run(["pkill", "-9", "qmicli"],
+                               capture_output=True, timeout=5)
+            except Exception:
+                pass
+            time.sleep(2)
+            try:
+                # 从 cmd 里提取 qmi_dev
+                dev = "/dev/cdc-wdm0"
+                for i, a in enumerate(cmd):
+                    if a == "-d" and i + 1 < len(cmd):
+                        dev = cmd[i + 1]
+                        break
+                subprocess.run(["qmicli", "-d", dev, "--wds-reset"],
+                               capture_output=True, timeout=20)
+            except Exception:
+                pass
+            time.sleep(2)
+    return last
 
 
 # ----------------------------------------------------------------------
@@ -240,8 +284,7 @@ class DataControl:
     def _step_reset(self):
         """Step 1: 清理残留 bearer."""
         self._olog("Step 1: 清理残留 bearer (wds-reset)")
-        rc, out, err = _run(
-            ["qmicli", "-d", self.qmi_dev, "--wds-reset"], timeout=15)
+        rc, out, err = _qmi_run(["qmicli", "-d", self.qmi_dev, "--wds-reset"], timeout=15)
         ok = rc == 0 and "Successfully" in out
         self._olog(f"  -> {'成功' if ok else '失败: ' + (err or out)[:100]}")
         return ok
@@ -249,8 +292,7 @@ class DataControl:
     def _step_data_format(self):
         """Step 2: 模块侧设为 raw-ip."""
         self._olog("Step 2: 模块侧设置 raw-ip (wda-set-data-format)")
-        rc, out, err = _run(
-            ["qmicli", "-d", self.qmi_dev,
+        rc, out, err = _qmi_run(["qmicli", "-d", self.qmi_dev,
              "--wda-set-data-format=raw-ip"], timeout=15)
         ok = rc == 0
         self._olog(f"  -> {'成功' if ok else '失败: ' + (err or out)[:100]}")
@@ -305,7 +347,7 @@ class DataControl:
         if self.auth:
             cmd.append(f"--wds-auth={self.auth}")
         cmd.append("--client-no-release-cid")
-        rc, out, err = _run(cmd, timeout=60)
+        rc, out, err = _qmi_run(cmd, timeout=60)
         if rc != 0:
             self._olog(f"  -> 失败: {(err or out)[:200]}")
             return None, None
@@ -324,13 +366,29 @@ class DataControl:
         cmd = ["qmicli", "-d", self.qmi_dev, "--wds-get-current-settings"]
         if self._cid:
             cmd += ["--client-cid=" + self._cid, "--client-no-release-cid"]
-        rc, out, err = _run(cmd, timeout=15)
+        rc, out, err = _qmi_run(cmd, timeout=15)
         if rc != 0:
             self._olog(f"  -> 失败: {err[:100]}")
             return {}
         info = {}
+        # v0.5.7: qmicli 的 IPv4 地址和掩码分两行输出, 需分别解析再合并
+        #   IPv4 address: 10.148.159.142
+        #   IPv4 subnet mask: 255.255.255.252
+        # IPv6 则是单行 CIDR 格式: IPv6 address: xxxx::1/64
+        m_ip = re.search(r"IPv4 address:\s*([\d.]+)", out)
+        m_mask = re.search(r"IPv4 subnet mask:\s*([\d.]+)", out)
+        if m_ip:
+            ip = m_ip.group(1)
+            bits = "32"
+            if m_mask:
+                # 掩码转 CIDR 位数
+                mask = m_mask.group(1)
+                try:
+                    bits = str(sum(bin(int(x)).count("1") for x in mask.split(".")))
+                except Exception:
+                    bits = "32"
+            info["ipv4"] = f"{ip}/{bits}"
         patterns = [
-            ("ipv4", r"IPv4 address:\s*([\d.]+)/(\d+)"),
             ("ipv4_gw", r"IPv4 gateway address:\s*([\d.]+)"),
             ("ipv6", r"IPv6 address:\s*([0-9a-fA-F:]+)/(\d+)"),
             ("ipv6_gw", r"IPv6 gateway address:\s*([0-9a-fA-F:]+)"),
@@ -378,7 +436,7 @@ class DataControl:
 
     def _step_verify(self, ip_type):
         """Step 7: ping 验证连通性 (不设默认路由, 用 -I)."""
-        target = "114.114.114.114" if ip_type == 4 else "2400:3200::1"
+        target = "223.5.5.5" if ip_type == 4 else "2400:3200::1"
         self._olog(f"Step 7: ping 验证 ({target})")
         r = self.ping_test(target, count=3)
         self._olog(f"  -> {'通' if r['ok'] else '不通'} "
@@ -406,9 +464,11 @@ class DataControl:
         info = self._step_get_settings()
         if not self._step_config_iface(info, ip_type):
             return False
-        if not self._step_verify(ip_type):
-            self._olog(f"IPv{ip_type} ping 不通, 放弃")
-            return False
+        # v0.5.7: 拿到 IP 即成功, ping 只记录不决定成败
+        # (用户: 拨号后 wwan0 有什么 IP 就显示什么, ping 是"测试连通性"的事)
+        ping_ok = self._step_verify(ip_type)
+        if not ping_ok:
+            self._olog(f"IPv{ip_type} 已配置但 ping 不通, 保留连接由用户手动测试")
         self._ip_type = ip_type
         self._olog(f"===== IPv{ip_type} 连接成功 =====")
         return True
@@ -440,15 +500,20 @@ class DataControl:
                    f"--wds-stop-network={self._handle}"]
             if self._cid:
                 cmd.append(f"--client-cid={self._cid}")
-            _run(cmd, timeout=30)
+            _qmi_run(cmd, timeout=30)
         self._clear_handle()
 
     def stop(self):
-        """关闭上网: 断 bearer + down 接口."""
+        """关闭上网: 先清 IP (立即显示断开), 再慢慢断 bearer."""
         self._olog("关闭 QMI 连接")
         self._stop_monitor()
-        self._stop_bearer()
+        # v0.5.7: 先清 IP/down 接口, 让状态立即显示"未连接"
+        # qmicli 可能卡死, 放后面慢慢处理
+        _run(["ip", "addr", "flush", "dev", self.iface], timeout=10)
         _run(["ip", "link", "set", self.iface, "down"], timeout=10)
+        self._olog("  网卡 IP 已清, 状态更新为未连接")
+        # 再断 bearer (可能慢, 不影响状态显示)
+        self._stop_bearer()
         self._olog("已关闭")
         return True
 
@@ -461,7 +526,7 @@ class DataControl:
                "--wds-get-packet-service-status"]
         if self._cid:
             cmd.append(f"--client-cid={self._cid}")
-        rc, out, _ = _run(cmd, timeout=15)
+        rc, out, _ = _qmi_run(cmd, timeout=15)
         return rc == 0 and "'connected'" in out
 
     # -- 地址查询 --
@@ -582,7 +647,7 @@ class DataControl:
         三段式连通性检查 (v0.5.5):
           1. bearer: QMI bearer 是否建立
           2. ip: wwan0 是否拿到 IP (v4/v6 分开)
-          3. internet: v4/v6 公网 ping 是否通 (两个都测)
+          3. internet: 按实际 IP 类型 ping 测试 (只测有的, 快速)
         返回 dict, 供页面分段显示绿/红.
         """
         result = {
@@ -597,25 +662,31 @@ class DataControl:
             "v4_detail": {},
             "v6_detail": {},
         }
-        # 1. bearer
-        result["bearer"] = self.is_connected()
-        if self._handle:
-            result["bearer_detail"] = f"handle={self._handle}"
-        # 2. IP (v0.5.6: 不依赖 bearer, 永远读网卡真实地址;
-        #    bearer 断但网卡有 IP 时, 照样显示并允许 ping 测)
+        # 2. IP 先行 (v0.5.6: 不依赖 bearer, 永远读网卡真实地址)
+        # v0.5.7: 先读 IP, 有 IP 就不查 bearer (qmicli 可能卡死)
         v4 = self.get_ipv4()
         v6 = self.get_ipv6()
         result["ipv4"] = v4
         result["ipv6"] = v6
         result["has_ipv4"] = bool(v4)
         result["has_ipv6"] = bool(v6)
-        # 3. 互联网 (两个都测, 各 2 个包快测)
+        # 1. bearer (有 IP 时跳过, 避免 qmicli 卡死拖慢测试)
+        if result["has_ipv4"] or result["has_ipv6"]:
+            result["bearer"] = True
+            result["bearer_detail"] = "有 IP, 跳过 bearer 检查"
+        else:
+            result["bearer"] = self.is_connected()
+            if self._handle:
+                result["bearer_detail"] = f"handle={self._handle}"
+        # 3. 互联网: 只测实际有的 IP 类型, 2 包快速测试 (v0.5.7 优化速度)
         if result["has_ipv4"]:
-            r = self.ping_test("114.114.114.114", count=2, timeout=8)
+            r = self.ping_test("223.5.5.5", count=2, timeout=5)
             result["internet_v4"] = r["ok"]
             result["v4_detail"] = r
         if result["has_ipv6"]:
-            r = self.ping_test("2400:3200::1", count=2, timeout=8)
+            # v0.5.7: 如果已有 IPv4 且通, IPv6 测试可选 (省时间)
+            # 为保持兼容仍测, 但用更短超时
+            r = self.ping_test("2400:3200::1", count=2, timeout=5)
             result["internet_v6"] = r["ok"]
             result["v6_detail"] = r
         return result

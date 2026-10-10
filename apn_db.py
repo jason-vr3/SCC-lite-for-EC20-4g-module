@@ -79,6 +79,26 @@ def find_apn(mcc, mnc):
     cands = [e for e in entries if "default" in e["type"].split(",")]
     if not cands:
         cands = entries
+    # v0.5.7: 中国运营商优先用标准 APN (避免选中 MVNO 或生僻 APN)
+    # 如电信 460/11 优先 ctnet 而非 ctlte
+    _preferred = {
+        ("460", "0"): ["cmnet"],           # 移动
+        ("460", "2"): ["cmnet"],
+        ("460", "7"): ["cmnet"],
+        ("460", "8"): ["cmnet"],
+        ("460", "1"): ["uninet", "3gnet"],  # 联通
+        ("460", "6"): ["uninet", "3gnet"],
+        ("460", "9"): ["uninet", "3gnet"],
+        ("460", "3"): ["ctnet"],           # 电信
+        ("460", "5"): ["ctnet"],
+        ("460", "11"): ["ctnet"],
+        ("460", "15"): ["cbnet"],          # 广电
+    }
+    pref_list = _preferred.get(key, [])
+    for pref_apn in pref_list:
+        for e in cands:
+            if e["apn"] == pref_apn:
+                return e
     # 优先有明确 carrier 名的
     cands.sort(key=lambda e: (0 if e["carrier"] else 1, e["apn"]))
     return cands[0]
@@ -95,8 +115,11 @@ def detect_carrier(imsi="", cops_name=""):
     # --- 1. IMSI 精确匹配 ---
     if len(imsi) >= 5 and imsi[:3].isdigit():
         mcc = imsi[:3]
-        # MNC 取 2 或 3 位: 先试 3 位, 找不到再试 2 位
-        for mnc_len in (3, 2):
+        # MNC 位数: 中国 MCC=460 的 MNC 恒为 2 位, 必须先取 2 位
+        # (取 3 位会把 MSIN 首位误判为 MNC, 如 4600036... 取 "003" 误判为电信)
+        # 其他国家先试 3 位, 找不到再试 2 位
+        mnc_lens = (2,) if mcc == "460" else (3, 2)
+        for mnc_len in mnc_lens:
             if len(imsi) >= 3 + mnc_len:
                 mnc = imsi[3:3 + mnc_len]
                 hit = find_apn(mcc, mnc)

@@ -75,6 +75,7 @@ label{font-size:13px;color:var(--muted)}
 <button data-t="sms"><span class="ico">💬</span><span class="txt">短信中心</span></button>
 <button data-t="device"><span class="ico">📱</span><span class="txt">设备管理</span></button>
 <button data-t="data"><span class="ico">🌐</span><span class="txt">蜂窝网络</span></button>
+<button data-t="dialog"><span class="ico">📝</span><span class="txt">拨号步骤</span></button>
 <button data-t="ussd"><span class="ico">⌨️</span><span class="txt">USSD</span></button>
 <button data-t="at"><span class="ico">💻</span><span class="txt">AT 终端</span></button>
 <button data-t="ec20"><span class="ico">📖</span><span class="txt">EC20 资料</span></button>
@@ -126,9 +127,21 @@ label{font-size:13px;color:var(--muted)}
 <button class="btn" id="btn-data-on" onclick="dataOn()">开启上网</button>
 <button class="btn danger" id="btn-data-off" onclick="dataOff()">关闭上网</button></div></div>
 <div class="card"><h2>Ping 测试</h2>
-<div class="row"><input id="ping-target" value="114.114.114.114" style="flex:2">
+<div class="row"><input id="ping-target" value="223.5.5.5" style="flex:2">
 <button class="btn" onclick="pingTest()">Ping 3 次</button></div>
 <div id="ping-result"></div></div>
+</section>
+<!-- Dial Steps -->
+<section id="t-dialog" class="hidden">
+<h1 class="page-title">拨号步骤</h1><p class="page-sub">开启/关闭/测试的逐步执行状态</p>
+<div class="card"><h2>操作 <button class="btn ghost" onclick="loadDialog()">刷新</button>
+<label style="margin-left:8px"><input type="checkbox" id="dialog-auto" checked onchange="toggleDialogAuto()"> 自动刷新(3s)</label></h2>
+<div class="row" style="margin-bottom:8px">
+<button class="btn" onclick="dataOn()">开启上网</button>
+<button class="btn danger" onclick="dataOff()">关闭上网</button>
+<button class="btn ghost" onclick="pingTest()">测试连通性</button>
+<button class="btn ghost" onclick="clearDialog()">清空日志</button></div>
+<pre id="dialog-output" style="max-height:500px;overflow-y:auto">等待操作…</pre></div>
 </section>
 <!-- USSD -->
 <section id="t-ussd" class="hidden">
@@ -190,7 +203,7 @@ document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
  b.classList.add('active');
  document.querySelectorAll('.main>section').forEach(s=>s.classList.add('hidden'));
  $('t-'+b.dataset.t).classList.remove('hidden');
- ({dash:loadDash,sms:loadSms,device:loadDevice,data:loadData,notify:loadNotify,ec20:loadEc20,atdoc:loadAtdoc,logs:loadLogs}[b.dataset.t]||(()=>{}))();
+ ({dash:loadDash,sms:loadSms,device:loadDevice,data:loadData,dialog:loadDialog,notify:loadNotify,ec20:loadEc20,atdoc:loadAtdoc,logs:loadLogs}[b.dataset.t]||(()=>{}))();
 });
 async function api(p,o={}){const r=await fetch(p,{...o,headers:{'Content-Type':'application/json',...(o.headers||{})}});
  if(r.status===401){location.reload();return null} return r.json()}
@@ -227,7 +240,10 @@ async function loadData(){const d=await api('/api/data');if(!d)return;
  <dt>IP</dt><dd>${esc(d.ip||'-')}</dd><dt>网卡</dt><dd>${esc(d.iface)}</dd></dl>`;
  $('btn-data-on').disabled=d.connected;$('btn-data-off').disabled=!d.connected;}
 async function dataOn(){$('data-info').innerHTML='拨号中…(约10秒)';
- const d=await api('/api/data/on',{method:'POST'});alert(d&&d.ok?'已连接':'失败: '+(d&&d.error));loadData();}
+ const d=await api('/api/data/on',{method:'POST'});
+ if(d&&d.dialing){alert('正在拨号，请稍候刷新查看状态');}
+ else{alert(d&&d.ok?'已连接':'失败: '+(d&&d.error));}
+ loadData();}
 async function dataOff(){const d=await api('/api/data/off',{method:'POST'});
  alert(d&&d.ok?'已断开':'失败');loadData();}
 async function pingTest(){const t=$('ping-target').value.trim()||'114.114.114.114';
@@ -272,6 +288,17 @@ function toggleLogAuto(){if($('log-auto').checked){logTimer=setInterval(loadLogs
 document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>{
  if(b.dataset.t==='logs'&&$('log-auto').checked&&!logTimer)logTimer=setInterval(loadLogs,5000);
  if(b.dataset.t!=='logs'&&logTimer){clearInterval(logTimer);logTimer=null;}
+}));
+// v0.5.7: 拨号步骤实时显示
+let dialogTimer=null;
+async function loadDialog(){const d=await api('/api/data/oplog');if(!d)return;
+ $('dialog-output').textContent=(d.logs||[]).join('\n')||'(暂无执行记录)';
+ $('dialog-output').scrollTop=$('dialog-output').scrollHeight;}
+function toggleDialogAuto(){if($('dialog-auto').checked){dialogTimer=setInterval(loadDialog,3000);}else{clearInterval(dialogTimer);dialogTimer=null;}}
+async function clearDialog(){await api('/api/data/oplog/clear',{method:'POST'});loadDialog();}
+document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>{
+ if(b.dataset.t==='dialog'&&$('dialog-auto').checked&&!dialogTimer)dialogTimer=setInterval(loadDialog,3000);
+ if(b.dataset.t!=='dialog'&&dialogTimer){clearInterval(dialogTimer);dialogTimer=null;}
 }));
 let notifyCfg={};
 async function loadNotify(){const d=await api('/api/notify');if(!d)return;notifyCfg=d;

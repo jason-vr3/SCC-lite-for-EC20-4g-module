@@ -25,7 +25,7 @@ import re
 import sqlite3
 import yaml
 
-VERSION = "0.5.6"
+VERSION = "0.5.7"
 from flask import Flask, request, jsonify, render_template_string, Response
 
 from modem import Modem, ModemError
@@ -76,14 +76,26 @@ def get_store():
     return db
 
 
+# v0.5.7: DataControl 单例, 保证操作日志跨请求可查
+_data_ctl_instance = None
+
 def get_data_ctl():
-    # modem_factory: 每次新建 Modem, 避免与短信模块抢串口
-    def _factory():
-        m = get_modem()
-        return m
-    at_port = config.get("modem", {}).get("port", "/dev/ttyUSB3")
-    return get_data_controller(config, modem_factory=_factory,
-                               at_port=at_port)
+    global _data_ctl_instance
+    if _data_ctl_instance is None:
+        # modem_factory: 每次新建 Modem, 避免与短信模块抢串口
+        def _factory():
+            m = get_modem()
+            return m
+        at_port = config.get("modem", {}).get("port", "/dev/ttyUSB3")
+        _data_ctl_instance = get_data_controller(config, modem_factory=_factory,
+                                   at_port=at_port)
+    else:
+        # 配置可能已更新 (如 APN 自动识别写回), 同步到单例
+        d = config.get("data", {}) if isinstance(config, dict) else {}
+        new_apn = d.get("apn", "")
+        if new_apn and _data_ctl_instance.apn != new_apn:
+            _data_ctl_instance.apn = new_apn
+    return _data_ctl_instance
 
 
 def _get_modem_for_data():
@@ -434,7 +446,8 @@ label{font-size:13px;color:var(--muted)}
 <!-- Data -->
 <section id="t-data" class="hidden">
 <h1 class="page-title">蜂窝网络</h1><p class="page-sub">QMI 数据连接管理 (v0.5.5 纯 QMI)</p>
-<div class="card"><h2>数据连接 <button class="btn ghost" onclick="loadData(1)">刷新</button></h2>
+<div class="row" style="display:flex;gap:12px;align-items:flex-start">
+<div class="card" style="flex:1"><h2>数据连接 <button class="btn ghost" onclick="loadData(1)">刷新</button></h2>
 <div id="data-info">加载中…</div>
 <div id="data-stages" style="margin-top:12px"></div>
 <div class="row" style="margin-top:8px">
@@ -442,6 +455,11 @@ label{font-size:13px;color:var(--muted)}
 <button class="btn danger" id="btn-data-off" onclick="dataOff()">关闭上网</button>
 <button class="btn ghost" id="btn-conn-test" onclick="testConnectivity()">测试连通性</button></div>
 <div id="conn-result" style="margin-top:8px"></div></div>
+<div class="card" style="flex:1"><h2>拨号步骤 <button class="btn ghost" onclick="loadDialog()">刷新</button>
+<button class="btn ghost" onclick="clearDialog()">清空</button></h2>
+<pre id="dialog-output" style="max-height:300px;overflow-y:auto;background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:6px;font-size:12px">等待操作…</pre>
+<label style="font-size:12px"><input type="checkbox" id="dialog-auto" checked onchange="toggleDialogAuto()"> 自动刷新(3s)</label></div>
+</div>
 <div class="card"><h2>QMI 操作日志 <button class="btn ghost" onclick="toggleOpLog()">展开/折叠</button>
 <button class="btn ghost" onclick="loadOpLog()">刷新</button></h2>
 <div id="oplog-box" style="display:none"><pre id="oplog-output" style="max-height:300px;overflow-y:auto">点击刷新查看…</pre></div></div>
@@ -707,7 +725,15 @@ async function loadData(fresh){const d=await api('/api/data'+(fresh?'?fresh=1':'
  loadCarrier();loadUsbnetMode();loadImplNotes();}
 async function dataOn(){$('data-info').innerHTML='连接中…(约10-20秒)';
  const d=await api('/api/data/on',{method:'POST'});
- if(d&&d.ok){await loadData();testConnectivity();}
+ if(d&&d.ok){
+   if(d.dialing){
+     $('data-info').innerHTML='正在拨号，请切换到「拨号步骤」tab 查看实时进度…';
+     // 3秒后刷新状态
+     setTimeout(loadData, 3000);
+   } else {
+     await loadData();testConnectivity();
+   }
+ }
  else{alert('失败: '+(d&&d.error));loadData();}}
 async function clearIpChange(){await api('/api/data/ipchange/clear',{method:'POST'});loadData();}
 // 三段式连通性: bearer -> IP -> 互联网
@@ -743,8 +769,14 @@ async function submitAccountChange(){
  if(d&&d.ok){alert(d.msg||'已保存，请重新登录');location.href='/logout';}
  else{$('acc-msg').textContent=d&&(d.error||'失败');}}
 async function dataOff(){if(!confirm('关闭上网将断开 PDP（省电），确定？'))return;
+ $('data-info').innerHTML='正在断开…';
  const d=await api('/api/data/off',{method:'POST'});
- alert(d&&d.ok?'已断开':'失败');loadData();}
+ if(d&&d.ok){
+   // v0.5.7: 立即刷新两边状态, 不等待自动刷新
+   await loadData(); await loadDialog();
+ } else {
+   alert('失败'); loadData();
+ }}
 async function pingTest(){const t=$('ping-target').value.trim()||'2400:3200::1';
  $('ping-result').innerHTML='测试中…';
  const d=await api('/api/data/ping',{method:'POST',body:JSON.stringify({target:t})});
@@ -822,6 +854,20 @@ function toggleLogAuto(){if($('log-auto').checked){logTimer=setInterval(loadLogs
 document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>{
  if(b.dataset.t==='logs'&&$('log-auto').checked&&!logTimer)logTimer=setInterval(loadLogs,5000);
  if(b.dataset.t!=='logs'&&logTimer){clearInterval(logTimer);logTimer=null;}
+}));
+// v0.5.7: 拨号步骤实时显示
+let dialogTimer=null;
+async function loadDialog(){const d=await api('/api/data/oplog');if(!d)return;
+ $('dialog-output').textContent=(d.logs||[]).join('\n')||'(暂无执行记录)';
+ $('dialog-output').scrollTop=$('dialog-output').scrollHeight;
+ // v0.5.7: 同步刷新左边数据连接状态, 避免拨号成功后状态不同步
+ if(typeof loadData==='function'){try{await loadData();}catch(e){}}
+}
+function toggleDialogAuto(){if($('dialog-auto').checked){dialogTimer=setInterval(loadDialog,3000);}else{clearInterval(dialogTimer);dialogTimer=null;}}
+async function clearDialog(){await api('/api/data/oplog/clear',{method:'POST'});loadDialog();}
+document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>{
+ if(b.dataset.t==='data'){loadDialog();if($('dialog-auto').checked&&!dialogTimer)dialogTimer=setInterval(loadDialog,3000);}
+ if(b.dataset.t!=='data'&&dialogTimer){clearInterval(dialogTimer);dialogTimer=null;}
 }));
 let notifyCfg={};
 async function loadNotify(){const d=await api('/api/notify');if(!d)return;notifyCfg=d;
@@ -1028,37 +1074,108 @@ def api_data():
 @requires_auth
 def api_data_on():
     ctl = get_data_ctl()
-    ok = ctl.start()
+    # v0.5.7: 先自动识别 APN (IMSI->APN 库), 不行再用配置的手写值
+    auto_apn = ""
+    auto_carrier = ""
+    try:
+        m = _get_modem_for_data()
+        try:
+            info = get_carrier_info(m)
+        finally:
+            m.close()
+        auto_apn = (info.get("apn") or "").strip()
+        auto_carrier = info.get("carrier", "")
+    except Exception as e:
+        # 自动识别失败, 用配置值继续, 不中断拨号
+        log.warning("APN 自动识别失败: %s", e)
+    if auto_apn:
+        # 识别成功: 覆盖当前 APN, 并写回 config.yaml (下次直接用)
+        if ctl.apn != auto_apn:
+            log.info("APN 自动识别: %s -> %s (%s)",
+                     ctl.apn or "(空)", auto_apn, auto_carrier)
+            ctl.apn = auto_apn
+            try:
+                if "data" not in config or not isinstance(config["data"], dict):
+                    config["data"] = {}
+                config["data"]["apn"] = auto_apn
+                save_config()
+            except Exception as e:
+                log.warning("APN 写回 config.yaml 失败: %s", e)
+    elif not ctl.apn:
+        # 自动识别失败且配置也为空: 无法拨号
+        return jsonify({"ok": False,
+                        "error": "无法自动识别 APN, 请在页面手动设置 APN 后再试"})
+    # v0.5.7: 异步拨号, 立即返回"拨号中", 避免前端长时间等待误报"失败"
+    # 前端 loadData() 会轮询 /api/data 获取最新状态
+    import threading
+    # 全局拨号标志, 防止并发拨号互相干扰 QMI
+    g = globals()
+    if "_dialing_in_progress" not in g:
+        g["_dialing_in_progress"] = False
+    def _do_dial():
+        try:
+            ok = ctl.start()
+            log.info("后台拨号完成: %s", "成功" if ok else "失败")
+        except Exception as e:
+            log.error("后台拨号异常: %s", e)
+        finally:
+            g["_dialing_in_progress"] = False
+    # 如果已经在拨号或已连接, 不重复启动
+    st = ctl.get_status()
+    if st.get("connected"):
+        d = dict(st)
+        d["apn_used"] = ctl.apn
+        if auto_carrier:
+            d["carrier_detected"] = auto_carrier
+        return jsonify({"ok": True, "dialing": False, **d})
+    if g["_dialing_in_progress"]:
+        d = ctl.get_status()
+        return jsonify({"ok": True, "dialing": True,
+                        "msg": "正在拨号中, 请勿重复点击", **d})
+    g["_dialing_in_progress"] = True
+    t = threading.Thread(target=_do_dial, daemon=True)
+    t.start()
     d = ctl.get_status()
-    err = ""
-    if not ok:
-        err = "连接失败"
-        if getattr(ctl, "mode", "ecm") == "qmi":
-            import shutil
-            if not shutil.which("qmicli"):
-                err = "未安装 qmicli (apt install libqmi-utils)"
-    elif not d.get("connected"):
-        err = "已执行但未连接，检查 APN/信号"
-    elif not d.get("ip") and not d.get("ipv6"):
-        err = "已连接但未获取 IP"
-    return jsonify({"ok": ok and d.get("connected"), "error": err, **d})
+    d["apn_used"] = ctl.apn
+    if auto_carrier:
+        d["carrier_detected"] = auto_carrier
+    return jsonify({"ok": True, "dialing": True,
+                    "msg": "正在拨号, 请稍候刷新查看状态", **d})
 
 
 @app.route("/api/data/off", methods=["POST"])
 @requires_auth
 def api_data_off():
-    ok = get_data_ctl().stop()
-    return jsonify({"ok": ok})
+    # v0.5.7: 异步断开, 立即返回, 避免 qmicli 卡死时前端长时间等待
+    import threading
+    ctl = get_data_ctl()
+    def _do_stop():
+        try:
+            ctl.stop()
+            log.info("后台断开完成")
+        except Exception as e:
+            log.error("后台断开异常: %s", e)
+    t = threading.Thread(target=_do_stop, daemon=True)
+    t.start()
+    return jsonify({"ok": True, "stopping": True, "msg": "正在断开…"})
 
 
 @app.route("/api/data/ping", methods=["POST"])
 @requires_auth
 def api_data_ping():
-    # v0.5.5: QMI 自动选 IP 类型, ping 目标默认按当前类型
+    # v0.5.7: 按 wwan0 实际 IP 选 ping 目标 (有 IPv4 用 IPv4, 否则用 IPv6)
     # 用户可在页面输入框改目标
     ctl = get_data_ctl()
     st = ctl.get_status()
-    default = "114.114.114.114" if st.get("ip_type") == 4 else "2400:3200::1"
+    has_v4 = bool(st.get("ipv4"))
+    has_v6 = bool(st.get("ipv6"))
+    if has_v4:
+        default = "223.5.5.5"
+    elif has_v6:
+        default = "2400:3200::1"
+    else:
+        # wwan0 无 IP, 按 ip_type 兜底
+        default = "223.5.5.5" if st.get("ip_type") == 4 else "2400:3200::1"
     target = request.get_json(force=True).get("target", default)
     return jsonify(ctl.ping_test(target, count=3))
 
@@ -1071,6 +1188,17 @@ def api_data_oplog():
     fn = getattr(ctl, "get_op_log", None)
     logs = fn(100) if fn else []
     return jsonify({"logs": logs})
+
+
+@app.route("/api/data/oplog/clear", methods=["POST"])
+@requires_auth
+def api_data_oplog_clear():
+    """清空 QMI 操作日志."""
+    ctl = get_data_ctl()
+    fn = getattr(ctl, "clear_op_log", None)
+    if fn:
+        fn()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/data/ipchange/clear", methods=["POST"])
