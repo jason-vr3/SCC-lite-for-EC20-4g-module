@@ -102,7 +102,7 @@ echo "==> Installing SCC-lite to $DST"
 mkdir -p "$DST/data"
 cp "$SRC/modem.py" "$SRC/notifications.py" "$SRC/data_control.py" \
    "$SRC/ec20_data.py" "$SRC/at_cheatsheet.py" "$SRC/qq_receiver.py" \
-   "$SRC/scc-lite.py" "$SRC/scc-web.py" "$SRC/apn_db.py" \
+   "$SRC/scc-lite.py" "$SRC/scc-web.py" "$SRC/apn_db.py" "$SRC/sms_pdu.py" \
    "$SRC/apns-conf.xml" "$SRC/requirements.txt" \
    "$SRC/udhcpc-noroute.sh" "$DST/"
 [ -f "$DST/config.yaml" ] || cp "$SRC/config.yaml.example" "$DST/config.yaml"

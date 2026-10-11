@@ -25,7 +25,7 @@ import re
 import sqlite3
 import yaml
 
-VERSION = "0.5.8"
+VERSION = "0.5.9"
 from flask import Flask, request, jsonify, render_template_string, Response
 
 from modem import Modem, ModemError

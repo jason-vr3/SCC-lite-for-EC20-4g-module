@@ -29,7 +29,7 @@ import sys
 import time
 import yaml
 
-VERSION = "0.5.8"  # v0.5.8: IPv4 改走 DHCP(udhcpc-noroute.sh)
+VERSION = "0.5.9"  # v0.5.9: 长短信 PDU 重组
 
 from modem import Modem, ModemError, decode_ucs2, is_ucs2_hex
 from notifications import Notifier
@@ -215,6 +215,9 @@ class Daemon:
 
         # Track seen modem indexes to avoid re-processing
         self._seen = set()
+        # v0.5.9: 长短信重组缓冲 {(sender, ref): {total, parts:{seq:body},
+        #   indices:[...], time, first_seen}}
+        self._concat_buf = {}
 
     def reload_notifications(self, notif_cfg):
         self.notifier.reload(notif_cfg)
@@ -227,9 +230,9 @@ class Daemon:
         return raw
 
     def poll_once(self):
-        """One SMS poll cycle. Returns number of new messages."""
-        # Open modem (acquires lock), poll, then close (releases lock)
-        # so web UI can use the modem between polls.
+        """One SMS poll cycle. Returns number of new messages.
+        v0.5.9: PDU 模式读取, 长短信按 UDH (ref/total/seq) 重组后存一条."""
+        import time as _time
         try:
             self.modem.open()
         except ModemError as e:
@@ -237,55 +240,122 @@ class Daemon:
             return 0
         try:
             try:
-                msgs = self.modem.sms_list("all")
-                log.info("poll: modem returned %d messages", len(msgs))
+                msgs = self.modem.sms_list_pdu(4)
+                log.info("poll: modem returned %d messages (pdu)", len(msgs))
             except ModemError as e:
-                log.warning("sms_list failed: %s", e)
+                log.warning("sms_list_pdu failed: %s", e)
                 return 0
 
             new_count = 0
             for m in msgs:
                 idx = m["index"]
-                # Only process unread incoming; skip already-seen
-                # (modem returns uppercase stat like "REC READ")
-                if m["stat"].upper() not in ("REC UNREAD", "REC READ"):
+                # PDU stat: 0=未读, 1=已读; 只处理收件箱
+                if str(m["stat"]) not in ("0", "1"):
                     continue
-                key = (m["sender"], m["time"], m["body"][:32])
+                dec = m.get("decoded")
+                if not dec:
+                    # 解析失败的不删, 留待下次; 打日志便于排查
+                    log.warning("poll: idx=%d PDU 解析失败, 跳过 (不删除)",
+                                idx)
+                    continue
+                key = (dec["sender"], dec["time"], dec["body"][:32])
                 if key in self._seen:
                     continue
                 self._seen.add(key)
 
-                body = self._decode_body(m["body"])
-                row_id = self.store.save_incoming(
-                    idx, m["sender"], body, m["time"])
-                log.info("new SMS from %s: %s", m["sender"], body[:60])
-                new_count += 1
+                if dec.get("is_concat"):
+                    self._concat_add(idx, dec)
+                else:
+                    row_id = self.store.save_incoming(
+                        idx, dec["sender"], dec["body"], dec["time"])
+                    log.info("new SMS from %s: %s",
+                             dec["sender"], dec["body"][:60])
+                    new_count += 1
+                    self._queue_forward(row_id)
+                    self._try_delete(idx)
 
-                # Queue for at-least-once forwarding (dedup via UNIQUE)
-                channels = [n for n in ("qq", "telegram", "webhook", "bark")
-                            if self.notifier._get_channel(n) is not None]
-                if channels:
-                    self.store.queue_forward(row_id, channels)
-                    log.info("queued forward for sms %d via %s",
-                             row_id, channels)
+            new_count += self._concat_flush(_time.time())
 
-                # Delete from modem to prevent SIM filling up
-                if self.delete_after_forward:
-                    try:
-                        self.modem.sms_delete(idx)
-                    except ModemError as e:
-                        log.warning("delete idx %d failed: %s", idx, e)
-
-            # Bound memory: keep last 5000 keys
             if len(self._seen) > 5000:
                 self._seen = set(list(self._seen)[-2500:])
             return new_count
         finally:
-            # Always release the modem lock
             try:
                 self.modem.close()
             except:
                 pass
+
+    def _concat_add(self, idx, dec):
+        """长短信分片进缓冲."""
+        import time as _time
+        key = (dec["sender"], dec["ref"])
+        buf = self._concat_buf.get(key)
+        if buf is None:
+            buf = {"total": dec["total"], "parts": {},
+                   "indices": [], "time": dec["time"],
+                   "first_seen": _time.time()}
+            self._concat_buf[key] = buf
+        # total 不一致时以最大的为准 (异常保护)
+        if dec["total"] > buf["total"]:
+            buf["total"] = dec["total"]
+        if dec["seq"] not in buf["parts"]:
+            buf["parts"][dec["seq"]] = dec["body"]
+            buf["indices"].append(idx)
+            log.info("concat part %d/%d from %s (ref %s)",
+                     dec["seq"], dec["total"], dec["sender"], dec["ref"])
+        # 分片已存缓冲, 从模块删除防 SIM 满
+        self._try_delete(idx)
+
+    def _concat_flush(self, now):
+        """检查缓冲, 完整的重组存库. 返回新增条数.
+        超 24h 未收齐的按已有分片存一条 (标注不完整)."""
+        done = 0
+        stale_keys = []
+        for key, buf in self._concat_buf.items():
+            total = buf["total"]
+            parts = buf["parts"]
+            complete = (len(parts) == total and
+                        all(s in parts for s in range(1, total + 1)))
+            expired = (now - buf["first_seen"] > 86400)
+            if not (complete or expired):
+                continue
+            sender = key[0]
+            if complete:
+                body = "".join(parts[s] for s in range(1, total + 1))
+                log.info("concat complete from %s: %d parts, %d chars",
+                         sender, total, len(body))
+            else:
+                # 超时未收齐: 按序号拼现有分片
+                seqs = sorted(parts.keys())
+                body = "".join(parts[s] for s in seqs)
+                body += f" [分片不完整 {len(seqs)}/{total}]"
+                log.warning("concat incomplete from %s: %d/%d parts",
+                            sender, len(seqs), total)
+            row_id = self.store.save_incoming(
+                -1, sender, body, buf["time"])
+            done += 1
+            self._queue_forward(row_id)
+            stale_keys.append(key)
+        for k in stale_keys:
+            del self._concat_buf[k]
+        return done
+
+    def _queue_forward(self, row_id):
+        """按配置渠道排队转发."""
+        channels = [n for n in ("qq", "telegram", "webhook", "bark")
+                    if self.notifier._get_channel(n) is not None]
+        if channels:
+            self.store.queue_forward(row_id, channels)
+            log.info("queued forward for sms %d via %s", row_id, channels)
+
+    def _try_delete(self, idx):
+        """从模块删除短信 (防 SIM 满), 失败只记日志."""
+        if not self.delete_after_forward:
+            return
+        try:
+            self.modem.sms_delete(idx)
+        except ModemError as e:
+            log.warning("delete idx %d failed: %s", idx, e)
 
     def process_forward_queue(self):
         """Background worker: (re)try pending forwards with backoff."""
@@ -329,13 +399,16 @@ class Daemon:
                 log.info("CNMI set to 2,1,0,0,0 (+CMTI URC enabled)")
             except ModemError as e:
                 log.warning("set_cnmi failed: %s", e)
-            for m in self.modem.sms_list("all"):
-                key = (m["sender"], m["time"], m["body"][:32])
+            for m in self.modem.sms_list_pdu(4):
+                dec = m.get("decoded")
+                if not dec:
+                    log.warning("prime: idx=%d PDU 解析失败", m["index"])
+                    continue
+                key = (dec["sender"], dec["time"], dec["body"][:32])
                 self._seen.add(key)
-                body = self._decode_body(m["body"])
                 # save_incoming returns existing id if duplicate
                 row_id = self.store.save_incoming(
-                    m["index"], m["sender"], body, m["time"])
+                    m["index"], dec["sender"], dec["body"], dec["time"])
                 # Mark as forwarded so restart doesn't re-notify
                 self.store.mark_forwarded(row_id)
             log.info("primed %d existing messages", len(self._seen))

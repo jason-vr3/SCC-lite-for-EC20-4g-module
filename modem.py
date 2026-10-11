@@ -392,6 +392,68 @@ class Modem:
         """
         self._cmd(f"at+cmgd={index}")
 
+    def sms_list_pdu(self, stat=4):
+        """AT+CMGL=<stat> PDU 模式读取短信.
+        stat: 0=未读, 1=已读, 2=未发, 3=已发, 4=全部.
+        返回 list of dicts: {index, stat, pdu, decoded, raw_header}.
+        decoded 为 sms_pdu.decode_pdu() 结果 (含 UDH ref/total/seq).
+        注意: 调用后模块停留在 PDU 模式; 发送等需文本模式的操作
+        会自己显式切 at+cmgf=1, 无需这里切回.
+        Source: 3GPP TS 27.007 §7.7, TS 23.040.
+        """
+        from sms_pdu import decode_pdu
+        self._cmd("at+cmgf=0")
+        lines = self._cmd(f"at+cmgl={stat}")
+        log.debug("sms_list_pdu: 原始返回 %d 行", len(lines))
+        msgs = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            # PDU 模式头: +CMGL: <idx>,<stat>[,<alpha>],<len>
+            # alpha 可能为空或不存在, 用更宽松的正则
+            m = re.match(r"\+CMGL:\s*(\d+)\s*,\s*(\d+)\s*,([^,]*),\s*(\d+)", line)
+            if not m:
+                # 尝试无 alpha 的格式: +CMGL: idx,stat,,len
+                m = re.match(r"\+CMGL:\s*(\d+)\s*,\s*(\d+)\s*,\s*,\s*(\d+)", line)
+                if m:
+                    idx, stat_v, pdu_len = m.group(1), m.group(2), m.group(3)
+                else:
+                    log.debug("sms_list_pdu: 跳过非头行: %s", line[:60])
+                    i += 1
+                    continue
+            else:
+                idx, stat_v, alpha, pdu_len = m.groups()
+            # 下一行是 PDU (可能跨多行? 先取一行, 不够再拼)
+            if i + 1 >= len(lines):
+                log.warning("sms_list_pdu: idx=%s 头行无后续 PDU 行", idx)
+                i += 1
+                continue
+            pdu_hex = lines[i + 1].strip()
+            # PDU 可能被截断? 检查长度是否合理 (至少 20 个 hex 字符)
+            if len(pdu_hex) < 20:
+                log.warning("sms_list_pdu: idx=%s PDU 过短 (%d): %s",
+                            idx, len(pdu_hex), pdu_hex[:40])
+            # 如果 PDU 看起来不完整 (非偶数长度或含非 hex), 尝试拼下一行
+            if len(pdu_hex) % 2 != 0 or not re.fullmatch(r"[0-9A-Fa-f]+", pdu_hex):
+                if i + 2 < len(lines):
+                    log.debug("sms_list_pdu: idx=%s PDU 疑似截断, 拼下一行", idx)
+                    pdu_hex += lines[i + 2].strip()
+                    i += 1  # 多消耗一行
+            decoded = decode_pdu(pdu_hex)
+            if decoded is None:
+                log.warning("sms_list_pdu: idx=%s PDU 解析失败, 原始: %s",
+                            idx, pdu_hex[:100])
+            msgs.append({
+                "index": int(idx),
+                "stat": stat_v,
+                "pdu": pdu_hex,
+                "decoded": decoded,
+                "raw_header": line,
+            })
+            i += 2
+        log.debug("sms_list_pdu: 解析出 %d 条", len(msgs))
+        return msgs
+
     def sms_delete_all(self):
         """
         Delete all SMS. Iterates AT+CMGL="ALL" then AT+CMGD per index.
