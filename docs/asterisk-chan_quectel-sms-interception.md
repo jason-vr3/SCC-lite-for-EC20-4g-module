@@ -1,88 +1,39 @@
-# chan_quectel 截胡短信问题笔记（2026-10-11，N1 实机）
-
-## 背景
-
-- 架构分工：Asterisk/chan_quectel 管语音（`ttyUSB1`/`ttyUSB2` + UAC 音频），
-  SCC-lite 管短信与 QMI 数据（独占 `/dev/ttyUSB3`）。串口分工不可互换。
-- SCC-lite 收短信靠 15 秒轮询 `AT+CMGL` 读模块存储。
+# chan_quectel 截胡短信（2026-10-11，N1 实机）
 
 ## 症状
 
-Asterisk 与 SCC-lite 同时运行时，短信偶发"人间蒸发"：
+Asterisk + SCC-lite 同跑时，短信偶发"人间蒸发"：`AT+CMGL` 查不到（没进模块存储），SCC-lite 库也没有。
 
-- `AT+CMGL` 查不到（没进模块存储）；
-- SCC-lite 数据库也没有；
-- 15 秒轮询不可能漏掉正常入库的短信，所以不是轮询问题。
+## 实锤
 
-之前曾误判"dialplan 没接住，但短信一定仍留在模块"——**这个判断不可靠**，
-是本次排障最大的弯路。
-
-## 实锤证据
-
-Asterisk 日志出现：
+Asterisk 日志：
 
 ```text
-Channel 'Local/sms@dongle-incoming-0000000f;1' sent to invalid extension
-(context,exten,priority=dongle-incoming,sms,1)
+Channel 'Local/sms@dongle-incoming-...' sent to invalid extension (...,dongle-incoming,sms,1)
 ```
 
-证明 chan_quectel 拦截了短信事件，并试图送进 `dongle-incoming,sms,1`
-（该 extension 不存在所以报 warning）。注意：`chan_dongle` 并未加载，
-实际加载的是 `chan_quectel.so`——这是 chan_quectel 自己的行为。
+是 `chan_quectel.so`（不是 chan_dongle）拦截了短信事件。
 
 ## 根因
 
-`asterisk -rx "quectel show device settings quectel0"` 显示：
-
 ```text
-Direct Message : On    ← 短信走 +CMT URC 直接送到 chan_quectel，不进模块存储
+Direct Message : On    ← +CMT 直接送 chan_quectel，不进模块存储
 Auto delete SMS : Yes  ← 读完即删
 ```
 
-短信被 +CMT 直接路由到 chan_quectel 手里，根本不进模块存储，
-SCC-lite 的 `AT+CMGL` 轮询永远看不到它。这就是"人间蒸发"的完整机制。
+"截胡 + 销毁"二连，SCC-lite 的 `AT+CMGL` 轮询永远看不见。
 
 ## 修复
 
-本机 chan_quectel（IchthysMaranatha 版）的 `/etc/asterisk/quectel.conf`
-保留 `disablesms` 选项（新版文档称该选项已移除，本版可用）：
+`/etc/asterisk/quectel.conf`：`disablesms=no` → `yes`（IchthysMaranatha 版保留此选项；新版文档说已移除，别被误导）。重启 asterisk，确认 `Disable SMS: Yes`。语音不受影响，还顺带避掉"通话中来短信搞崩 chan_quectel"的 bug。
 
-```ini
-disablesms=no  →  disablesms=yes
-```
+## 走过的弯路
 
-配置注释原文：
+1. 误判"dialplan 没接住，短信一定还在模块里"——错，+CMT 直达的不进存储。
+2. 先怀疑自己代码，查 `_parse_udh` 崩溃路径半天；诊断（零重启、无 poll error）排除后才回头查截胡。分诊顺序反了：**应先直连 AT 看模块存储，存储里没有 = 上游问题**。
+3. "让 10086 发短信"测试法含糊：用自己手机发，回复只到自己手机，测了个寂寞。
+4. "没收到"有两种：分片被 daemon 收走但不齐（查 journal `concat part` + DB 新行）vs 压根没到模块——先分清再动手。
 
-```text
-; disable of SMS reading from device when received
-;  chan_quectel has currently a bug with SMS reception. When a SMS gets in during a
-;  call chan_quectel might crash. Enable this option to disable sms reception.
-```
+## 验证
 
-关闭短信接收还能顺带避掉"通话中来短信可能搞崩 chan_quectel"的已知 bug，
-一举两得。语音通话不受影响。
-
-生效与确认：
-
-```bash
-sed -i -E 's/^(disablesms\s*=\s*)no/\1yes/' /etc/asterisk/quectel.conf
-systemctl restart asterisk
-asterisk -rx "quectel show device settings quectel0" | grep -iE "disable sms|auto delete"
-# 期望: Disable SMS : Yes
-```
-
-此后短信的唯一入口为 SCC-lite。
-
-## 验证（2026-10-11）
-
-- asterisk + scc-lite 全开，手机发长短信 → SCC-lite 正常合并入库；
-- `journalctl -u asterisk --since "1 hour ago"` 与
-  `/var/log/asterisk/messages` 均无 `sms@` / `invalid extension`，
-  chan_quectel 未再碰短信。
-
-## 教训
-
-多个程序共享一个 4G 模块时，"短信丢了"先查有没有**第二个消费者在截胡**，
-再怀疑自己的代码。直连 AT 看模块存储（`AT+CMGL`）是最高效的分诊手段：
-存储里没有 → 问题在模块上游（被截胡/没送达）；存储里有但软件没读到 →
-问题在软件侧。
+全开状态收长短信：SCC-lite 正常合并入库；asterisk 日志 1 小时无 sms warning。
