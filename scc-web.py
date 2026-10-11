@@ -25,7 +25,7 @@ import re
 import sqlite3
 import yaml
 
-VERSION = "0.5.7"
+VERSION = "0.5.8"
 from flask import Flask, request, jsonify, render_template_string, Response
 
 from modem import Modem, ModemError
@@ -219,16 +219,17 @@ def _cache_refresh_all():
 
 
 def _cache_loop():
-    """后台线程: 短周期 tick, 由各端点独立间隔决定是否真刷 (队列式错峰)."""
+    """后台线程: 启动立即刷一次, 之后短周期 tick."""
     import time
     import logging
     log = logging.getLogger("scc-lite.web")
-    log.info("cache thread started (tick=10s, system/data active=%ds idle=%ds, "
-             "device active=%ds idle=%ds)",
-             CACHE_ACTIVE_INTERVAL, CACHE_IDLE_INTERVAL,
-             CACHE_DEVICE_ACTIVE, CACHE_DEVICE_IDLE)
+    log.info("cache thread started")
+    try:
+        _cache_refresh_all()
+    except Exception as e:
+        log.warning("cache initial refresh error: %s", e)
     while True:
-        time.sleep(10)  # tick 固定 10 秒, 轻量; 真正刷不刷由各端点间隔决定
+        time.sleep(10)
         try:
             _cache_refresh_all()
         except Exception as e:
@@ -236,16 +237,12 @@ def _cache_loop():
 
 
 def _cache_start():
-    """启动后台刷新线程 (daemon, 随主进程退出)."""
+    """启动后台刷新线程 (daemon, 随主进程退出).
+    v0.5.8-fix: 不再同步阻塞全量扫描, 线程内立即刷一次."""
     global _cache_thread
     if _cache_thread and _cache_thread.is_alive():
         return
     import threading
-    # 启动时先刷一次, 让登录进来就有数据
-    try:
-        _cache_refresh_all()
-    except Exception:
-        pass
     _cache_thread = threading.Thread(target=_cache_loop, daemon=True,
                                      name="scc-cache")
     _cache_thread.start()
@@ -299,6 +296,26 @@ button.btn:hover{background:var(--green-dark)}
 button.btn.danger{background:#e57373}
 button.btn.ghost{background:#eef3ee;color:#4a5a4a}
 button.btn:disabled{background:#ccc}
+/* iOS 风格开关 */
+.ios-switch{position:relative;display:inline-block;width:52px;height:30px;flex:none}
+.ios-switch input{opacity:0;width:0;height:0}
+.ios-switch .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;
+ background:#e9e9ea;border-radius:30px;transition:.3s}
+.ios-switch .slider:before{position:absolute;content:"";height:26px;width:26px;
+ left:2px;top:2px;background:#fff;border-radius:50%;transition:.3s;
+ box-shadow:0 2px 5px rgba(0,0,0,.25)}
+.ios-switch input:checked+.slider{background:#34c759}
+.ios-switch input:checked+.slider:before{transform:translateX(22px)}
+.ios-switch input:disabled+.slider{opacity:.5;cursor:not-allowed}
+/* iOS 风格信号格 */
+.ios-signal{display:flex;align-items:flex-end;gap:3px;height:20px}
+.ios-signal span{width:4px;background:#e0e0e0;border-radius:1px}
+.ios-signal span:nth-child(1){height:6px}
+.ios-signal span:nth-child(2){height:10px}
+.ios-signal span:nth-child(3){height:14px}
+.ios-signal span:nth-child(4){height:17px}
+.ios-signal span:nth-child(5){height:20px}
+.ios-signal span.on{background:#2e3a2e}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:9px;border-bottom:1px solid var(--border);vertical-align:top}
 th{color:var(--muted);font-weight:500}
@@ -341,10 +358,8 @@ label{font-size:13px;color:var(--muted)}
 <button data-t="sms"><span class="ico">💬</span><span class="txt">短信中心</span></button>
 <button data-t="device"><span class="ico">📱</span><span class="txt">设备管理</span></button>
 <button data-t="data"><span class="ico">🌐</span><span class="txt">蜂窝网络</span></button>
-<button data-t="ussd"><span class="ico">⌨️</span><span class="txt">USSD</span></button>
-<button data-t="at"><span class="ico">💻</span><span class="txt">AT 终端</span></button>
+<button data-t="at"><span class="ico">💻</span><span class="txt">指令终端</span></button>
 <button data-t="ec20"><span class="ico">📖</span><span class="txt">EC20 资料</span></button>
-<button data-t="atdoc"><span class="ico">📚</span><span class="txt">AT 速查</span></button>
 <button data-t="logs"><span class="ico">📋</span><span class="txt">实时日志</span></button>
 <button data-t="notify"><span class="ico">🔔</span><span class="txt">消息推送</span></button>
 </nav>
@@ -445,19 +460,23 @@ label{font-size:13px;color:var(--muted)}
 </section>
 <!-- Data -->
 <section id="t-data" class="hidden">
-<h1 class="page-title">蜂窝网络</h1><p class="page-sub">QMI 数据连接管理 (v0.5.5 纯 QMI)</p>
+<h1 class="page-title">蜂窝网络</h1><p class="page-sub">QMI 数据连接管理 (v0.5.8 纯 QMI)</p>
 <div class="row" style="display:flex;gap:12px;align-items:flex-start">
 <div class="card" style="flex:1"><h2>数据连接 <button class="btn ghost" onclick="loadData(1)">刷新</button></h2>
 <div id="data-info">加载中…</div>
 <div id="data-stages" style="margin-top:12px"></div>
+<div class="row" style="margin-top:8px;margin-bottom:2px;align-items:flex-end">
+<div class="ios-signal" id="data-signal"><span></span><span></span><span></span><span></span><span></span></div>
+<span id="data-signal-text" style="font-size:12px;color:var(--muted)">-</span>
+</div>
 <div class="row" style="margin-top:8px">
-<button class="btn" id="btn-data-on" onclick="dataOn()">开启上网</button>
-<button class="btn danger" id="btn-data-off" onclick="dataOff()">关闭上网</button>
+<label class="ios-switch"><input type="checkbox" id="data-toggle" onchange="toggleData(this.checked)"><span class="slider"></span></label>
+<span id="data-toggle-label" style="font-size:14px;color:var(--muted)">未连接</span>
 <button class="btn ghost" id="btn-conn-test" onclick="testConnectivity()">测试连通性</button></div>
 <div id="conn-result" style="margin-top:8px"></div></div>
-<div class="card" style="flex:1"><h2>拨号步骤 <button class="btn ghost" onclick="loadDialog()">刷新</button>
+<div class="card" style="flex:1;min-width:0"><h2>拨号步骤 <button class="btn ghost" onclick="loadDialog()">刷新</button>
 <button class="btn ghost" onclick="clearDialog()">清空</button></h2>
-<pre id="dialog-output" style="max-height:300px;overflow-y:auto;background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:6px;font-size:12px">等待操作…</pre>
+<pre id="dialog-output" style="height:300px;overflow-y:auto;overflow-x:auto;white-space:pre;background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:6px;font-size:12px">等待操作…</pre>
 <label style="font-size:12px"><input type="checkbox" id="dialog-auto" checked onchange="toggleDialogAuto()"> 自动刷新(3s)</label></div>
 </div>
 <div class="card"><h2>QMI 操作日志 <button class="btn ghost" onclick="toggleOpLog()">展开/折叠</button>
@@ -473,22 +492,19 @@ label{font-size:13px;color:var(--muted)}
 <div class="row"><input id="ping-target" value="2400:3200::1" style="flex:2">
 <button class="btn" onclick="pingTest()">Ping 3 次</button></div>
 <div id="ping-result"></div>
-<p class="muted">注：广电 IPv4 被拦截，请用 IPv6 目标测试</p></div>
+<p class="muted">注：IPv4/IPv6 目标均可，IPv4 如 223.5.5.5，IPv6 如 2400:3200::1</p></div>
 <div class="card"><h2>实现说明 <button class="btn ghost" onclick="copyImpl()">复制指令</button></h2>
 <pre id="impl-notes">加载中…</pre></div>
 </section>
 <!-- USSD -->
-<section id="t-ussd" class="hidden">
-<h1 class="page-title">USSD</h1><p class="page-sub">交互式运营商指令（如查余额）</p>
+<!-- 指令终端: USSD + AT -->
+<section id="t-at" class="hidden">
+<h1 class="page-title">指令终端</h1><p class="page-sub">USSD 与 AT 指令</p>
 <div class="card"><h2>USSD 会话</h2>
 <div class="row"><input id="ussd-code" placeholder="如 *101#" style="flex:2">
 <button class="btn" onclick="ussdSend()">发送</button>
 <button class="btn ghost" onclick="ussdCancel()">取消会话</button></div>
 <pre id="ussd-result">等待输入…</pre></div>
-</section>
-<!-- AT terminal -->
-<section id="t-at" class="hidden">
-<h1 class="page-title">AT 终端</h1><p class="page-sub">直接执行 AT 指令</p>
 <div class="card"><h2>AT 命令</h2>
 <div class="row"><input id="at-cmd" placeholder="如 AT+CSQ" style="flex:3">
 <button class="btn" onclick="atSend()">执行</button></div>
@@ -499,11 +515,7 @@ label{font-size:13px;color:var(--muted)}
 <h1 class="page-title">EC20 资料</h1><p class="page-sub">EC20 全系规格速查</p>
 <div class="card"><h2>EC20 全系 <button class="btn ghost" onclick="loadEc20()">刷新</button></h2>
 <div id="ec20-info">加载中…</div></div>
-</section>
-<!-- AT 速查 -->
-<section id="t-atdoc" class="hidden">
-<h1 class="page-title">AT 速查</h1><p class="page-sub">EC20 指令速查（标注出处）</p>
-<div class="card"><h2>指令搜索</h2>
+<div class="card"><h2>AT 指令速查</h2>
 <div class="row"><input id="atdoc-q" placeholder="输入关键字，如 SMS / CREG / QCFG" style="flex:3">
 <button class="btn" onclick="loadAtdoc()">搜索</button></div>
 <div class="row" id="atdoc-cats"></div>
@@ -539,7 +551,7 @@ document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
  b.classList.add('active');
  document.querySelectorAll('.main>section').forEach(s=>s.classList.add('hidden'));
  $('t-'+b.dataset.t).classList.remove('hidden');
- ({dash:loadDash,sms:loadSms,device:loadDevice,data:loadData,notify:loadNotify,ec20:loadEc20,atdoc:loadAtdoc,logs:loadLogs}[b.dataset.t]||(()=>{}))();
+ ({dash:loadDash,sms:loadSms,device:loadDevice,data:loadData,notify:loadNotify,ec20:()=>{loadEc20();loadAtdoc();},logs:loadLogs}[b.dataset.t]||(()=>{}))();
 });
 async function api(p,o={}){const r=await fetch(p,{...o,headers:{'Content-Type':'application/json',...(o.headers||{})}});
  if(r.status===401){location.reload();return null} return r.json()}
@@ -607,6 +619,7 @@ async function usbUmount(dev){if(!confirm('卸载将同时删除其 Samba 共享
 async function sambaShare(path){const d=await api('/api/system/samba/share',{method:'POST',body:JSON.stringify({path})});
  if(d&&d.ok){alert('共享已创建！\n'+d.hint);loadUsb();}else alert('创建失败: '+(d&&d.error||'未知'));}
 async function loadDashModem(){const d=await api('/api/device');if(!d)return;
+ if(d.scanning){$('dash-modem').innerHTML='<p class="muted">正在扫描设备信息…</p>';return;}
  const rs={0:'未注册',1:'已注册(本地)',2:'搜索中',3:'被拒绝',5:'已注册(漫游)'}[d.reg?.stat]??'-';
  $('dash-modem').innerHTML=`<div onclick="goTab('device')" style="cursor:pointer"><dl class="kv">
  <dt>型号</dt><dd>${esc(d.model||'-')}</dd>
@@ -694,6 +707,8 @@ async function sendSms(){const to=(currentContact||$('sms-to').value.trim()),tex
  $('sms-send-status').textContent=d&&d.ok?'✅ 已发送':'❌ '+(d&&d.error||'失败');
  if(d&&d.ok){$('sms-text').value='';$('sms-text').style.height='auto';currentContact=to;setTimeout(loadSms,1000);}}
 async function loadDevice(fresh){const d=await api('/api/device'+(fresh?'?fresh=1':''));if(!d)return;
+ // v0.5.8-fix: 后台还没扫完时显示占位, 不闪空值
+ if(d.scanning){$('device-info').innerHTML='<p class="muted">正在扫描设备信息…</p>';return;}
  const r=d.reg||{};const regTxt={0:'未注册',1:'已注册(本地)',2:'搜索中',3:'被拒绝',5:'已注册(漫游)'}[r.stat]??('stat='+r.stat);
  $('device-info').innerHTML=`<dl class="kv">
  <dt>IMEI</dt><dd>${esc(d.imei)}</dd><dt>IMSI</dt><dd>${esc(d.imsi)}</dd>
@@ -721,20 +736,50 @@ async function loadData(fresh){const d=await api('/api/data'+(fresh?'?fresh=1':'
  <dt>IP 类型</dt><dd>${d.ip_type?('IPv'+d.ip_type):'-'}</dd>
  <dt>IPv6</dt><dd>${v6}</dd><dt>IPv4</dt><dd>${esc(d.ipv4||'-')}</dd>
  <dt>网卡</dt><dd>${esc(d.iface)}</dd></dl>${ipChg}`;
- $('btn-data-on').disabled=d.connected;$('btn-data-off').disabled=!d.connected;
+ // v0.5.8-fix: 拨号/断开进行中不碰开关, 等结果出来再跳变
+ if(!window._dataBusy){$('data-toggle').checked=d.connected;$('data-toggle').disabled=false;}
+ $('data-toggle-label').textContent=d.connected?'已连接':'未连接';
+ $('data-toggle-label').style.color=d.connected?'#2e7d32':'var(--muted)';
+ updateDataSignal();
  loadCarrier();loadUsbnetMode();loadImplNotes();}
+async function updateDataSignal(){
+ const d=await api('/api/device');if(!d)return;
+ const r=d.signal?.rssi,bars=$('data-signal').children;
+ let n=0;
+ if(typeof r==='number'&&r<=31)n=r>=25?5:r>=20?4:r>=15?3:r>=10?2:r>=1?1:0;
+ for(let i=0;i<bars.length;i++)bars[i].classList.toggle('on',i<n);
+ $('data-signal-text').textContent=(typeof r==='number'&&r<=31)?('RSSI '+r):'无信号';}
+async function toggleData(on){
+ const tg=$('data-toggle');tg.disabled=true;window._dataBusy=true;
+ try{
+ if(on){await dataOn();}
+ else{await dataOff();}
+ }finally{window._dataBusy=false;tg.disabled=false;}}
 async function dataOn(){$('data-info').innerHTML='连接中…(约10-20秒)';
  const d=await api('/api/data/on',{method:'POST'});
  if(d&&d.ok){
    if(d.dialing){
-     $('data-info').innerHTML='正在拨号，请切换到「拨号步骤」tab 查看实时进度…';
-     // 3秒后刷新状态
-     setTimeout(loadData, 3000);
+     $('data-info').innerHTML='正在拨号…';
+     // v0.5.8: fresh 轮询直到真正连上, 开关与执行同步
+     const ok=await waitDataState(true,60000);
+     await loadData(1);
+     if(ok)testConnectivity();
+     else $('data-info').innerHTML+='<br>拨号超时，请查看「拨号步骤」';
    } else {
-     await loadData();testConnectivity();
+     await loadData(1);testConnectivity();
    }
  }
- else{alert('失败: '+(d&&d.error));loadData();}}
+ else{alert('失败: '+(d&&d.error));await loadData(1);}}
+// v0.5.8: 用 fresh=1 实时扫描轮询数据状态, 直到符合预期或超时
+async function waitDataState(want,timeoutMs){
+ const t0=Date.now();
+ while(Date.now()-t0<timeoutMs){
+   try{const d=await api('/api/data?fresh=1');
+     if(d&&!!d.connected===want)return true;
+   }catch(e){}
+   await new Promise(r=>setTimeout(r,1500));
+ }
+ return false;}
 async function clearIpChange(){await api('/api/data/ipchange/clear',{method:'POST'});loadData();}
 // 三段式连通性: bearer -> IP -> 互联网
 async function testConnectivity(){$('conn-result').innerHTML='测试中…(约10秒)';
@@ -768,14 +813,15 @@ async function submitAccountChange(){
   old_password:$('acc-oldpw').value,new_password:npw})});
  if(d&&d.ok){alert(d.msg||'已保存，请重新登录');location.href='/logout';}
  else{$('acc-msg').textContent=d&&(d.error||'失败');}}
-async function dataOff(){if(!confirm('关闭上网将断开 PDP（省电），确定？'))return;
+async function dataOff(){
  $('data-info').innerHTML='正在断开…';
  const d=await api('/api/data/off',{method:'POST'});
  if(d&&d.ok){
-   // v0.5.7: 立即刷新两边状态, 不等待自动刷新
-   await loadData(); await loadDialog();
+   // v0.5.8: fresh 轮询直到真正断开, 开关与执行同步
+   await waitDataState(false,15000);
+   await loadData(1); await loadDialog();
  } else {
-   alert('失败'); loadData();
+   alert('失败'); await loadData(1);
  }}
 async function pingTest(){const t=$('ping-target').value.trim()||'2400:3200::1';
  $('ping-result').innerHTML='测试中…';
@@ -805,7 +851,7 @@ AT+CGDCONT=1,"IPV4V6","cbnet"
 AT+CGACT=1,1
 ip link set usb0 up
 # 等待 IPv6: ip -6 addr show usb0
-# 4. 测试 (广电 IPv4 被拦截, 用 IPv6)
+# 4. 测试连通性
 ping -6 -I usb0 2400:3200::1
 # 5. 关闭上网 (省电)
 ip link set usb0 down
@@ -858,8 +904,11 @@ document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',
 // v0.5.7: 拨号步骤实时显示
 let dialogTimer=null;
 async function loadDialog(){const d=await api('/api/data/oplog');if(!d)return;
- $('dialog-output').textContent=(d.logs||[]).join('\n')||'(暂无执行记录)';
- $('dialog-output').scrollTop=$('dialog-output').scrollHeight;
+ const el=$('dialog-output');
+ // v0.5.8: 只有用户已在底部才自动滚到底, 避免阅读时跳变
+ const nearBottom=el.scrollHeight-el.scrollTop-el.clientHeight<40;
+ el.textContent=(d.logs||[]).join('\n')||'(暂无执行记录)';
+ if(nearBottom)el.scrollTop=el.scrollHeight;
  // v0.5.7: 同步刷新左边数据连接状态, 避免拨号成功后状态不同步
  if(typeof loadData==='function'){try{await loadData();}catch(e){}}
 }
@@ -1027,8 +1076,8 @@ def api_device():
         return jsonify(data)
     data = _cache_get("device")
     if data is None:
-        data = _scan_device()
-        _cache_set("device", data)
+        # v0.5.8-fix: 缓存为空时不阻塞等 AT, 先返回占位, 后台线程会补上
+        return jsonify({"port": "", "scanning": True})
     return jsonify(data)
 
 

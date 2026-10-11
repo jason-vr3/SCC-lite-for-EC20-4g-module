@@ -22,6 +22,7 @@ if command -v apt-get >/dev/null 2>&1; then
     PKG_QMI="libqmi-utils"             # qmicli
     PKG_IPROUTE="iproute2"             # ip 命令
     PKG_PING="iputils-ping"            # ping 命令
+    PKG_DHCP="udhcpc"                 # udhcpc (wwan0 DHCP, v0.5.8+)
     PKG_SAMBA="samba"                  # smbd/nmbd, smbpasswd
     PKG_EXFAT="exfatprogs"             # exfat 工具
     PKG_NTFS="ntfs-3g"                # ntfs 读写
@@ -36,6 +37,7 @@ elif command -v dnf >/dev/null 2>&1; then
     PKG_QMI="libqmi"
     PKG_IPROUTE="iproute"
     PKG_PING="iputils"
+    PKG_DHCP=""                       # 未验证包名, 见下方手动安装提示
     PKG_SAMBA="samba"
     PKG_EXFAT="exfatprogs"
     PKG_NTFS="ntfs-3g"
@@ -50,6 +52,7 @@ elif command -v yum >/dev/null 2>&1; then
     PKG_QMI="libqmi"
     PKG_IPROUTE="iproute"
     PKG_PING="iputils"
+    PKG_DHCP=""                       # 未验证包名, 见下方手动安装提示
     PKG_SAMBA="samba"
     PKG_EXFAT="exfatprogs"
     PKG_NTFS="ntfs-3g"
@@ -64,6 +67,7 @@ elif command -v pacman >/dev/null 2>&1; then
     PKG_QMI="libqmi"
     PKG_IPROUTE="iproute2"
     PKG_PING="iputils"
+    PKG_DHCP=""                       # 未验证包名, 见下方手动安装提示
     PKG_SAMBA="samba"
     PKG_EXFAT="exfatprogs"
     PKG_NTFS="ntfs-3g"
@@ -78,6 +82,7 @@ elif command -v zypper >/dev/null 2>&1; then
     PKG_QMI="libqmi"
     PKG_IPROUTE="iproute2"
     PKG_PING="iputils"
+    PKG_DHCP=""                       # 未验证包名, 见下方手动安装提示
     PKG_SAMBA="samba"
     PKG_EXFAT="exfatprogs"
     PKG_NTFS="ntfs-3g"
@@ -98,9 +103,10 @@ mkdir -p "$DST/data"
 cp "$SRC/modem.py" "$SRC/notifications.py" "$SRC/data_control.py" \
    "$SRC/ec20_data.py" "$SRC/at_cheatsheet.py" "$SRC/qq_receiver.py" \
    "$SRC/scc-lite.py" "$SRC/scc-web.py" "$SRC/apn_db.py" \
-   "$SRC/apns-conf.xml" "$SRC/requirements.txt" "$DST/"
+   "$SRC/apns-conf.xml" "$SRC/requirements.txt" \
+   "$SRC/udhcpc-noroute.sh" "$DST/"
 [ -f "$DST/config.yaml" ] || cp "$SRC/config.yaml.example" "$DST/config.yaml"
-chmod +x "$DST/scc-lite.py" "$DST/scc-web.py" "$DST/qq_receiver.py"
+chmod +x "$DST/scc-lite.py" "$DST/scc-web.py" "$DST/qq_receiver.py" "$DST/udhcpc-noroute.sh"
 
 # ------------------------------------------------------------------
 # Python 依赖 (优先系统包, 失败转 pip)
@@ -129,6 +135,19 @@ for _cmd in ip ping; do
     esac
   fi
 done
+
+# ------------------------------------------------------------------
+# udhcpc: wwan0 DHCP 客户端 (v0.5.8+, IPv4 拨号必需)
+# ------------------------------------------------------------------
+if ! command -v udhcpc >/dev/null 2>&1; then
+  if [ -n "$PKG_DHCP" ]; then
+    echo "==> Installing $PKG_DHCP (udhcpc, wwan0 DHCP)"
+    $PM_UPDATE && $PM_INSTALL $PKG_DHCP
+  else
+    echo "!! 本发行版未预置 udhcpc 包名, 请手动安装提供 udhcpc 的包"
+    echo "   (v0.5.8+ IPv4 拨号必需, 缺失时拨号日志会明确报错)"
+  fi
+fi
 
 # ------------------------------------------------------------------
 # Samba + 文件系统工具 (USB 挂载/Samba 共享, v0.5.6+)

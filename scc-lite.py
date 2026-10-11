@@ -29,7 +29,7 @@ import sys
 import time
 import yaml
 
-VERSION = "0.5.7"  # v0.5.7: APN 自动识别+自动应用, data_path bug 修复
+VERSION = "0.5.8"  # v0.5.8: IPv4 改走 DHCP(udhcpc-noroute.sh)
 
 from modem import Modem, ModemError, decode_ucs2, is_ucs2_hex
 from notifications import Notifier
