@@ -73,6 +73,13 @@
     - [54. _parse_udh 截断崩溃路径（本地复现、未在 N1 触发）](#p54)
     - [55. "10086 长短信收不到"真因：chan_quectel 截胡（本节详见第三章专题）](#p55)
     - [56. v0.5.9 发布](#p56)
+  - [2026-10-12](#2026-10-12)
+    - [57. at+qdownload 在 EC20-CE 上返回 ERROR](#p57)
+    - [58. QFirehose 被 glibc fortify 误杀](#p58)
+    - [59. Sahara 报错：模块停在 EDL 里跑着旧 programmer](#p59)
+    - [60. R06A15 上 uac_fs=1 让 UAC 完全不可用](#p60)
+    - [61. R06A15 出厂 usbcfg 默认关 UAC](#p61)
+    - [62. 刷机前备份 AT 配置](#p62)
 - [三、专题：PDU 长短信重组与 chan_quectel 截胡](#三专题pdu-长短信重组与-chan_quectel-截胡)
 - [四、铁律与纪律汇总](#四铁律与纪律汇总)
 
@@ -449,6 +456,53 @@ IMEI `866041049020974`，2026-10-10 起用移动卡（IMSI `46000` 开头）。
   分片自动从模块删除；asterisk+scc-lite 全开下复测正常。
 - 发布：GitHub commit `cd1a5dda`，tag v0.5.9，Release 已建；
   tarball 附件需用户手动上传（uploads.github.com 不在 token scope 内）。
+
+### 2026-10-12
+
+#### <a id="p57"></a>57. `at+qdownload` 在 EC20-CE 上返回 ERROR
+- 现象：想进 9008 下载模式，发 `at+qdownload` 返回 ERROR，`lsusb` 无 `05c6:9008`。
+- 根因：`at+qdownload` 是 EC200U/EG91xU 等新系列的命令，EC20-CE 的 R06A05 根本不支持；
+  官方文档里 EC20 进 9008 的方法只有 USB_BOOT 引脚短接。
+- 教训：EC20 在 Linux 下刷机靠 QFirehose 经 DM 口自己切 EDL 模式，不用 AT 命令进下载模式。
+- 验证：QFirehose 日志显示 DIAG 切 EDL 成功，重枚举出 `05c6:9008`。
+
+#### <a id="p58"></a>58. QFirehose 被 glibc fortify 误杀（`buffer overflow detected`）
+- 现象：QFirehose 跑到 programmer 握手返回 "Supported Functions" 后，
+  报 `*** buffer overflow detected ***` 被杀掉。
+- 根因：glibc 的 fortify 机制拦截了 QFirehose 自身的栈溢出——溢出是 benign 的，
+  crash 点在握手之后、第一个写 flash 命令之前，模块 NAND 没被碰过。
+- 教训：fortify 报警不等于致命；`gcc -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector`
+  关掉重编。先认"工具坏了不是模块坏了"，再动手。
+- 验证：重编后一次跑完，22 秒刷写完成。
+
+#### <a id="p59"></a>59. Sahara 报错：模块停在 EDL 里跑着旧 programmer
+- 现象：第二次跑 QFirehose 报 Sahara 超时/垃圾数据。
+- 根因：run1 crash 后模块还停在 EDL 里，跑着 run1 上传的 programmer（在 RAM 里），
+  它只懂 firehose 协议，工具却跟它说 Sahara 语，协议错配。
+- 教训：断电重插 USB（programmer 跑在 RAM 里，断电就没了），再跑就干净了。
+- 验证：断电重插后一次成功。
+
+#### <a id="p60"></a>60. R06A15 上 `uac_fs=1` 让 UAC 完全不可用
+- 现象：刷机后按旧习惯设 `at+qaudcfg="uac_fs",1`，UAC 声卡直接不可用。
+- 根因：R06A15 上该参数行为变化（changelog 写 R06A05 起默认值改为 0）。
+- 教训：**硬结论——R06A15 上 `uac_fs` 保持 0，以后不碰这个参数。**
+- 验证：改回 0 后 `arecord -l` 见 `card 1: Android`，UAC 正常。
+
+#### <a id="p61"></a>61. R06A15 出厂 usbcfg 默认关 UAC
+- 现象：刷机后 `arecord -l` 看不到 Android 声卡。
+- 根因：R06A15 出厂 `usbcfg` 最后一位是 0（UAC 关），旧固件上是手动开到 1 的。
+- 教训：刷机后必须把 `AT+QCFG="USBCFG",0x2C7C,0x0125,1,1,1,1,1,0,1` 写回去，
+  再 `at+cfun=1,1` 重启让 USB 重枚举。
+- 验证：重启后声卡回来；N1 重启后 SCC 短信+上网验证正常。
+
+#### <a id="p62"></a>62. 刷机前备份 AT 配置
+- 现象：无（流程记录）。
+- 过程：停 scc-lite 释放 ttyUSB3，导出 `at+cgmr` / `ati` / `at+cgmm` / `at+cimi` /
+  `usbcfg` / `ims` / `usbnet` / `urcport` / `uac_fs` / `qmbncfg list` 存档
+  `~/fw/backup-20261012.txt`（796 字节）。
+- 教训：刷机前备份是铁律；备份时发现当时插的是广电卡（IMSI 46015 开头），
+  跟记录里的移动卡对不上——动手前先确认现状跟记录是否一致。
+- 验证：刷后逐项回写，重配清单与备份一致。
 
 ---
 
