@@ -25,13 +25,20 @@ import re
 import sqlite3
 import yaml
 
-VERSION = "0.5.9"
+VERSION = "0.6.0"  # v0.6.0: 多模块 + 适配层
 from flask import Flask, request, jsonify, render_template_string, Response
 
-from modem import Modem, ModemError
+from modem import Modem, ModemError, scan_ports
 from data_control import (get_data_controller, get_usbnet_mode,
                             get_carrier_info, provision_apn,
-                            set_usbnet_mode, USBNET_MODES)
+                            set_usbnet_mode, USBNET_MODES,
+                            find_qmi_for_tty)
+try:
+    from modem_profiles import detect as _profile_detect
+    HAS_PROFILES = True
+except ImportError:
+    HAS_PROFILES = False
+    _profile_detect = None
 from notifications import Notifier
 from ec20_data import EC20_COMMON, EC20_VARIANTS, FIRMWARE_NOTE, APPLICATIONS
 from at_cheatsheet import search as at_search, by_category as at_by_cat, CATEGORIES
@@ -58,9 +65,13 @@ def save_config():
     notifier.reload(config.get("notifications", {}))
 
 
-def get_modem():
+def get_modem(imei=None):
+    """按模块取 Modem (用完即关). imei=None 时用第一个启用的模块."""
+    mod = _get_module(imei)
+    port = (mod.get("port") if mod else None) or \
+        config.get("modem", {}).get("port", "/dev/ttyUSB3")
     m = Modem(
-        port=config.get("modem", {}).get("port", "/dev/ttyUSB3"),
+        port=port,
         baudrate=config.get("modem", {}).get("baudrate", 115200),
         timeout=10,
     )
@@ -68,39 +79,148 @@ def get_modem():
     return m
 
 
+def _get_module(imei=None):
+    """从 DB 取模块记录. imei=None 返回第一个启用的."""
+    db = get_store()
+    try:
+        if imei:
+            r = db.execute("SELECT * FROM modules WHERE imei=?",
+                           (imei,)).fetchone()
+        else:
+            r = db.execute("SELECT * FROM modules WHERE enabled=1"
+                           " ORDER BY added_at LIMIT 1").fetchone()
+        return dict(r) if r else None
+    finally:
+        db.close()
+
+
+
+def _req_module():
+    """从请求里取模块 IMEI (query ?module= 或 JSON body).
+    无请求上下文 (如后台线程) 时返回 None."""
+    try:
+        m = request.args.get("module", "").strip()
+    except Exception:
+        return None
+    if not m:
+        try:
+            j = request.get_json(force=True, silent=True) or {}
+            m = (j.get("module") or "").strip()
+        except Exception:
+            pass
+    return m or None
+
+def list_modules():
+    """列出所有模块 (DB 注册表)."""
+    db = get_store()
+    try:
+        rows = db.execute("SELECT * FROM modules ORDER BY added_at").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        db.close()
+
+
+def upsert_module_db(imei, alias="", port="", profile="EC20Profile",
+                     enabled=1, model=""):
+    """新增/更新模块 (端口变化自动重绑). 历史短信保留."""
+    if not imei:
+        return False
+    if not alias:
+        alias = f"{profile.replace('Profile', '')}-{imei[-4:]}"
+    db = get_store()
+    try:
+        db.execute(
+            "INSERT INTO modules (imei, alias, port, profile, model, enabled)"
+            " VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT(imei) DO UPDATE SET"
+            " alias=excluded.alias, port=excluded.port,"
+            " profile=excluded.profile, model=excluded.model,"
+            " enabled=excluded.enabled",
+            (imei, alias, port, profile, model, enabled))
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
 def get_store():
     data_dir = config.get("data_dir", "/opt/scc-lite-for-EC20-4g-module/data")
     path = os.path.join(data_dir, "scc-lite.db")
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
+    # v0.6.0: 保证多模块表结构存在 (daemon 会做完整迁移, 这里兜底)
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS modules (
+            imei TEXT PRIMARY KEY, alias TEXT DEFAULT '', port TEXT DEFAULT '',
+            profile TEXT DEFAULT 'EC20Profile', model TEXT DEFAULT '',
+            enabled INTEGER DEFAULT 1,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        mcols = [r["name"] for r in
+                 db.execute("PRAGMA table_info(modules)").fetchall()]
+        if mcols and "model" not in mcols:
+            db.execute("ALTER TABLE modules ADD COLUMN model TEXT DEFAULT ''")
+        cols = [r["name"] for r in
+                db.execute("PRAGMA table_info(sms)").fetchall()]
+        if cols and "module_id" not in cols:
+            db.execute("ALTER TABLE sms ADD COLUMN module_id TEXT DEFAULT ''")
+        if cols and "read" not in cols:
+            db.execute("ALTER TABLE sms ADD COLUMN read INTEGER DEFAULT 0")
+        if cols and "imsi" not in cols:
+            db.execute("ALTER TABLE sms ADD COLUMN imsi TEXT DEFAULT ''")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_sms_module"
+                   " ON sms(module_id)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_sms_imsi ON sms(imsi)")
+        # v0.6.1: IMSI->号码映射表
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS sim_numbers (
+                imsi TEXT PRIMARY KEY,
+                number TEXT DEFAULT '',
+                alias TEXT DEFAULT '',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        if mcols and "current_imsi" not in mcols:
+            db.execute("ALTER TABLE modules ADD COLUMN current_imsi TEXT DEFAULT ''")
+        db.commit()
+    except Exception:
+        pass
     return db
 
 
 # v0.5.7: DataControl 单例, 保证操作日志跨请求可查
-_data_ctl_instance = None
+# v0.6.0: 改为每模块一个实例 (按 IMEI), 各模块独立拨号/udhcpc/pidfile
+_data_ctl_instances = {}
 
-def get_data_ctl():
-    global _data_ctl_instance
-    if _data_ctl_instance is None:
+def get_data_ctl(imei=None):
+    """按模块取 DataControl. imei=None 时用第一个启用的模块."""
+    mod = _get_module(imei)
+    key = (mod["imei"] if mod else "") or "_default"
+    inst = _data_ctl_instances.get(key)
+    if inst is None:
         # modem_factory: 每次新建 Modem, 避免与短信模块抢串口
-        def _factory():
-            m = get_modem()
-            return m
-        at_port = config.get("modem", {}).get("port", "/dev/ttyUSB3")
-        _data_ctl_instance = get_data_controller(config, modem_factory=_factory,
-                                   at_port=at_port)
+        def _factory(_mod=mod):
+            return get_modem(_mod["imei"] if _mod else None)
+        at_port = (mod.get("port") if mod else None) or \
+            config.get("modem", {}).get("port", "/dev/ttyUSB3")
+        # v0.6.0: 按 USB 路径绑定同模块的 cdc-wdm/wwan
+        qmi_dev, wwan = find_qmi_for_tty(at_port)
+        d = config.get("data", {}) if isinstance(config, dict) else {}
+        inst = get_data_controller(
+            {"data": {"qmi_dev": qmi_dev or d.get("qmi_dev", "/dev/cdc-wdm0"),
+                      "wwan_iface": wwan or d.get("wwan_iface", "wwan0"),
+                      "apn": d.get("apn", "")}},
+            modem_factory=_factory, at_port=at_port)
+        _data_ctl_instances[key] = inst
     else:
-        # 配置可能已更新 (如 APN 自动识别写回), 同步到单例
+        # 配置可能已更新 (如 APN 自动识别写回), 同步到实例
         d = config.get("data", {}) if isinstance(config, dict) else {}
         new_apn = d.get("apn", "")
-        if new_apn and _data_ctl_instance.apn != new_apn:
-            _data_ctl_instance.apn = new_apn
-    return _data_ctl_instance
+        if new_apn and inst.apn != new_apn:
+            inst.apn = new_apn
+    return inst
 
 
-def _get_modem_for_data():
+def _get_modem_for_data(imei=None):
     """数据相关 AT 操作用的 Modem (用完即关)."""
-    m = get_modem()
+    m = get_modem(imei)
     return m
 
 
@@ -145,6 +265,9 @@ CACHE_IDLE_TIMEOUT = 300      # N 秒无认证请求则判无人 (5 分钟)
 # device (AT 扫描) 独立间隔: 比上面减半频率, 减少串口争用
 CACHE_DEVICE_ACTIVE = 60      # 有人用时, device 刷新间隔 (秒)
 CACHE_DEVICE_IDLE = 600       # 无人时, device 刷新间隔 (秒, 10 分钟)
+# v0.6.x: 信号轻量缓存 (AT+CSQ 单命令 <1s, 与重型 device 扫描解耦)
+CACHE_SIGNAL_ACTIVE = 20      # 有人用时, signal 刷新间隔 (秒)
+CACHE_SIGNAL_IDLE = 120       # 无人时, signal 刷新间隔 (秒)
 
 _cache = {}                   # key -> {"ts": float, "data": dict}
 _cache_last_active = 0.0      # 最后认证请求时间戳
@@ -203,8 +326,6 @@ def _cache_refresh_all():
     # (key, 扫描函数, 活跃间隔, 空闲间隔)
     jobs = (
         ("system", _scan_system, CACHE_ACTIVE_INTERVAL, CACHE_IDLE_INTERVAL),
-        ("data", _scan_data, CACHE_ACTIVE_INTERVAL, CACHE_IDLE_INTERVAL),
-        ("device", _scan_device, CACHE_DEVICE_ACTIVE, CACHE_DEVICE_IDLE),
     )
     for key, fn, int_active, int_idle in jobs:
         interval = int_active if active else int_idle
@@ -214,6 +335,69 @@ def _cache_refresh_all():
             continue  # 还没到该端点的刷新时间, 跳过 (错峰)
         try:
             _cache_set(key, fn())
+        except Exception as e:
+            log.warning("cache refresh %s failed: %s", key, e)
+    # v0.6.0-fix: data 缓存也按模块分别刷新
+    interval = CACHE_ACTIVE_INTERVAL if active else CACHE_IDLE_INTERVAL
+    try:
+        mods = list_modules()
+    except Exception:
+        mods = []
+    if not mods:
+        mods = [{"imei": ""}]
+    for mod in mods:
+        imei = mod.get("imei", "")
+        key = f"data:{imei or 'default'}"
+        with _cache_lock_get():
+            ts = _cache.get(key, {}).get("ts", 0)
+        if now - ts < interval:
+            continue
+        try:
+            _cache_set(key, _scan_data(imei or None))
+        except Exception as e:
+            log.warning("cache refresh %s failed: %s", key, e)
+    # v0.6.0: 设备缓存按模块分别刷新
+    interval = CACHE_DEVICE_ACTIVE if active else CACHE_DEVICE_IDLE
+    try:
+        mods = list_modules()
+    except Exception:
+        mods = []
+    if not mods:
+        mods = [{"imei": ""}]
+    for mod in mods:
+        imei = mod.get("imei", "")
+        key = f"device:{imei or 'default'}"
+        with _cache_lock_get():
+            ts = _cache.get(key, {}).get("ts", 0)
+        if now - ts < interval:
+            continue
+        try:
+            _cache_set(key, _scan_device(imei or None))
+        except Exception as e:
+            log.warning("cache refresh %s failed: %s", key, e)
+    # v0.6.x: 信号轻量缓存 (AT+CSQ 单命令, 20s 刷一次, 与重型扫描解耦)
+    # 信号是无线电测量, 与拨号状态无关, 打开页面即有
+    interval = CACHE_SIGNAL_ACTIVE if active else CACHE_SIGNAL_IDLE
+    try:
+        mods = list_modules()
+    except Exception:
+        mods = []
+    if not mods:
+        mods = [{"imei": ""}]
+    for mod in mods:
+        imei = mod.get("imei", "")
+        key = f"signal:{imei or 'default'}"
+        with _cache_lock_get():
+            ts = _cache.get(key, {}).get("ts", 0)
+        if now - ts < interval:
+            continue
+        try:
+            m = get_modem(imei or None)
+            try:
+                sig = m.get_signal()
+            finally:
+                m.close()
+            _cache_set(key, sig)
         except Exception as e:
             log.warning("cache refresh %s failed: %s", key, e)
 
@@ -315,7 +499,7 @@ button.btn:disabled{background:#ccc}
 .ios-signal span:nth-child(3){height:14px}
 .ios-signal span:nth-child(4){height:17px}
 .ios-signal span:nth-child(5){height:20px}
-.ios-signal span.on{background:#2e3a2e}
+.ios-signal span.on{background:#34c759}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:9px;border-bottom:1px solid var(--border);vertical-align:top}
 th{color:var(--muted);font-weight:500}
@@ -377,23 +561,37 @@ label{font-size:13px;color:var(--muted)}
 <div style="display:flex;gap:8px;justify-content:flex-end">
 <button class="btn ghost" onclick="closeAccountModal()">取消</button>
 <button class="btn" onclick="submitAccountChange()">保存</button></div></div></div>
+<!-- v0.6.1: 号码管理弹窗 (顶层, 任意 tab 可调) -->
+<div id="sim-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:99;align-items:center;justify-content:center">
+<div style="background:#fff;border-radius:8px;padding:20px;width:640px;max-width:92vw;max-height:84vh;overflow-y:auto">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+<h3 style="margin:0">号码管理</h3><button class="btn ghost" onclick="closeSimModal()">✕</button></div>
+<p class="muted" style="font-size:12px;margin:0 0 12px">IMSI 跟 SIM 卡走，换模块零操作。同一号码可对应多张 SIM（补卡）。新卡插入后自动出现，填一次永久有效。</p>
+<div id="sim-modal-warn"></div>
+<div id="sim-modal-list">加载中…</div>
+</div></div>
 </aside>
 <div class="main">
 <!-- Dashboard -->
 <section id="t-dash">
 <h1 class="page-title">仪表盘</h1><p class="page-sub">实时查看设备状态与短信</p>
 <div class="stats">
-<div class="stat"><div class="num" id="st-signal">-</div><div class="lbl">信号 RSSI</div></div>
-<div class="stat"><div class="num" id="st-reg">-</div><div class="lbl">网络注册</div></div>
+<div class="stat"><div class="num" id="st-mods">-</div><div class="lbl">在线模块</div></div>
+<div class="stat"><div class="num" id="st-unread">-</div><div class="lbl">未读短信</div></div>
+<div class="stat"><div class="num" id="st-data">-</div><div class="lbl">上网中</div></div>
 <div class="stat"><div class="num" id="st-sms">-</div><div class="lbl">短信总数</div></div>
-<div class="stat"><div class="num" id="st-data">-</div><div class="lbl">蜂窝网络</div></div>
+</div>
+<!-- v0.6.0: 模块卡片组 -->
+<div class="card" style="margin-bottom:14px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+<h2 style="margin:0">📱 4G 模块</h2>
+<button class="btn" onclick="goTab('device');setTimeout(openScan,300)">＋ 扫描添加模块</button>
+</div>
+<div id="dash-modules" style="display:flex;gap:12px;flex-wrap:wrap">加载中…</div>
 </div>
 <div style="display:flex;gap:14px;flex-wrap:wrap">
 <div class="card" style="flex:1;min-width:280px"><h2>本地设备信息 <button class="btn ghost" onclick="loadDashSys(1)">刷新</button></h2>
 <div id="dash-sys">加载中…</div></div>
-<div class="card" style="flex:1;min-width:280px"><h2>4G 模块 <button class="btn ghost" onclick="loadDashModem()">刷新</button></h2>
-<div id="dash-modem">加载中…</div>
-<p class="muted">点击模块可跳转到设备管理页查看详情</p></div>
 <div class="card" style="flex:1;min-width:280px"><h2>💾 USB 外接设备 <button class="btn ghost" onclick="loadUsb()">刷新</button></h2>
 <div id="samba-status" style="font-size:12px;color:var(--muted);margin-bottom:6px">Samba 状态: 检查中…</div>
 <div id="usb-list" style="font-size:13px">加载中…</div>
@@ -402,7 +600,11 @@ label{font-size:13px;color:var(--muted)}
 </section>
 <!-- SMS (iOS style) -->
 <section id="t-sms" class="hidden">
-<h1 class="page-title">短信中心</h1><p class="page-sub">iOS 风格会话</p>
+<h1 class="page-title">短信中心</h1><p class="page-sub">iOS 风格会话 (v0.6.1 按号码/IMSI，不按模块)</p>
+<div class="card" style="padding:12px;margin-bottom:12px"><div class="row" style="align-items:center">
+<label style="font-size:13px">当前号码：</label><select id="sms-number" onchange="loadSms()" style="max-width:280px"></select>
+<span id="sms-number-loc" class="muted" style="font-size:12px"></span>
+<button class="btn ghost" onclick="openSimModal()" style="margin-left:auto">🔢 号码管理</button></div></div>
 <div class="card" style="padding:12px">
 <div class="row">
 <button class="btn ghost" onclick="exportBackup()">📥 全量导出</button>
@@ -451,7 +653,16 @@ label{font-size:13px;color:var(--muted)}
 <!-- Device -->
 <section id="t-device" class="hidden">
 <h1 class="page-title">设备管理</h1><p class="page-sub">模组状态与射频控制</p>
+<!-- v0.6.0: 模块管理 -->
+<div class="card"><h2>📱 模块管理 <button class="btn ghost" onclick="loadModules()">刷新</button></h2>
+<div class="row" style="margin-bottom:10px">
+<button class="btn" onclick="openScan()">🔍 扫描串口</button>
+<span class="muted" style="font-size:12px">扫描空闲串口识别 4G 模块，点选添加；被占用的端口只提示、不触碰</span>
+</div>
+<div id="scan-result" style="margin-bottom:10px"></div>
+<div id="module-list">加载中…</div></div>
 <div class="card"><h2>设备状态 <button class="btn ghost" onclick="loadDevice(1)">刷新</button></h2>
+<div class="row" style="margin-bottom:8px"><label style="font-size:13px">查看模块：</label><select id="device-module" onchange="loadDevice(1)" style="max-width:260px"></select></div>
 <div id="device-info">加载中…</div></div>
 <div class="card"><h2>飞行模式</h2>
 <div class="row"><span id="flight-status">未知</span>
@@ -460,7 +671,10 @@ label{font-size:13px;color:var(--muted)}
 </section>
 <!-- Data -->
 <section id="t-data" class="hidden">
-<h1 class="page-title">蜂窝网络</h1><p class="page-sub">QMI 数据连接管理 (v0.5.8 纯 QMI)</p>
+<h1 class="page-title">蜂窝网络</h1><p class="page-sub">QMI 数据连接管理 (v0.6.0 每模块独立)</p>
+<div class="card" style="margin-bottom:12px"><div class="row" style="align-items:center">
+<label style="font-size:13px">操作模块：</label><select id="data-module" onchange="loadData(1)" style="max-width:260px"></select>
+<span class="muted" style="font-size:12px">每个模块独立拨号/断网/Ping，走各自的 wwan 网卡，不加默认路由</span></div></div>
 <div class="row" style="display:flex;gap:12px;align-items:flex-start">
 <div class="card" style="flex:1"><h2>数据连接 <button class="btn ghost" onclick="loadData(1)">刷新</button></h2>
 <div id="data-info">加载中…</div>
@@ -501,14 +715,16 @@ label{font-size:13px;color:var(--muted)}
 <section id="t-at" class="hidden">
 <h1 class="page-title">指令终端</h1><p class="page-sub">USSD 与 AT 指令</p>
 <div class="card"><h2>USSD 会话</h2>
-<div class="row"><input id="ussd-code" placeholder="如 *101#" style="flex:2">
+<div class="row"><label style="font-size:13px">模块：</label><select id="at-module" style="max-width:220px"></select>
+<input id="ussd-code" placeholder="如 *101#" style="flex:2">
 <button class="btn" onclick="ussdSend()">发送</button>
 <button class="btn ghost" onclick="ussdCancel()">取消会话</button></div>
 <pre id="ussd-result">等待输入…</pre></div>
 <div class="card"><h2>AT 命令</h2>
 <div class="row"><input id="at-cmd" placeholder="如 AT+CSQ" style="flex:3">
 <button class="btn" onclick="atSend()">执行</button></div>
-<pre id="at-result">等待输入…</pre></div>
+<pre id="at-result">等待输入…</pre>
+<p class="muted" style="font-size:12px">v0.6.0: 结束标记行 (OK / ERROR / +CME ERROR 等) 会完整显示</p></div>
 </section>
 <!-- EC20 资料 -->
 <section id="t-ec20" class="hidden">
@@ -551,17 +767,102 @@ document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
  b.classList.add('active');
  document.querySelectorAll('.main>section').forEach(s=>s.classList.add('hidden'));
  $('t-'+b.dataset.t).classList.remove('hidden');
- ({dash:loadDash,sms:loadSms,device:loadDevice,data:loadData,notify:loadNotify,ec20:()=>{loadEc20();loadAtdoc();},logs:loadLogs}[b.dataset.t]||(()=>{}))();
+ ({dash:loadDash,sms:()=>{loadSimNumbers();loadSms();},device:loadDevice,data:loadData,notify:loadNotify,ec20:()=>{loadEc20();loadAtdoc();},logs:loadLogs}[b.dataset.t]||(()=>{}))();
 });
 async function api(p,o={}){const r=await fetch(p,{...o,headers:{'Content-Type':'application/json',...(o.headers||{})}});
  if(r.status===401){location.reload();return null} return r.json()}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-async function loadDash(){const [dev,sms,data]=await Promise.all([api('/api/device'),api('/api/sms'),api('/api/data')]);
- if(dev){$('st-signal').textContent=dev.signal?.rssi??'-';
-  const rs={0:'未注册',1:'已注册',2:'搜索中',3:'被拒',5:'漫游'};$('st-reg').textContent=rs[dev.reg?.stat]??'-';}
- if(sms)$('st-sms').textContent=sms.messages.length;
- if(data)$('st-data').textContent=data.connected?((data.ipv6&&data.ipv6[0])||data.ip||'已连接'):'未连接';
- loadDashSys();loadDashModem();loadUsb();}
+async function loadDash(){
+ // v0.6.0: 仪表盘汇总一次取全
+ const d=await api('/api/dashboard');if(!d)return;
+ const mods=d.modules||[];
+ const online=mods.filter(m=>m.enabled);
+ $('st-mods').textContent=online.length+'/'+mods.length;
+ $('st-unread').textContent=mods.reduce((a,m)=>a+(m.unread||0),0);
+ $('st-data').textContent=mods.filter(m=>m.data&&m.data.connected).length;
+ $('st-sms').textContent=mods.reduce((a,m)=>a+(m.sms_count||0),0);
+ renderDashModules(mods);
+ loadDashSys();loadUsb();}
+function sigBars(rssi){
+ // RSSI dBm -> 5 格 (iOS 风格)
+ // v0.6.x: null=加载中, 99=modem 明确无信号
+ if(rssi==null||rssi==='')return '<span style="color:#999">...</span>';
+ if(rssi===99)return '<span style="color:#999">无信号</span>';
+ const v=parseInt(rssi);let n=0;
+ if(v>=-70)n=5;else if(v>=-80)n=4;else if(v>=-90)n=3;else if(v>=-100)n=2;else n=1;
+ let s='';for(let i=0;i<5;i++)s+=`<span style="display:inline-block;width:4px;margin-right:2px;border-radius:1px;background:${i<n?'#34c759':'#e0e0e0'};height:${6+i*3}px"></span>`;
+ return s+` <span style="font-size:12px;color:#666">${v}dBm</span>`;}
+function renderDashModules(mods){
+ const box=$('dash-modules');
+ _dashModsCache=mods;
+ if(!mods.length){box.innerHTML='<p class="muted">暂无模块，点击右上「扫描添加模块」</p>';return;}
+ const rs={0:'未注册',1:'已注册',2:'搜索中',3:'被拒',5:'漫游'};
+ box.innerHTML=mods.map(m=>{
+  const dot=m.enabled?'#34c759':'#999';
+  const reg=rs[m.reg?.stat]??'-';
+  // v0.6.0-fix: 运营商显示链 carrier(IMSI映射) -> COPS名 -> '-'
+  const oper=m.carrier||m.operator?.oper||'-';
+  const sig=sigBars(m.signal?.rssi);
+  const conn=!!(m.data&&m.data.connected);
+  const ip=m.data&&m.data.ipv4?`<div style="font-size:12px;color:#666">${esc(m.data.ipv4)}</div>`:'';
+  const fb=m.fallback?`<div style="font-size:12px;color:#b26a00">⚠️ ${esc(m.model||'未知型号')} 按 EC20 兼容模式运行</div>`:'';
+  const un=m.unread?` <span class="badge" style="background:#e53935;color:#fff">${m.unread} 未读</span>`:'';
+  // v0.6.1: 显示当前 SIM (号码/IMSI), 未设号码可点进号码管理
+  const simHtml=m.current_imsi?
+   (m.sim_number?`<a href="javascript:openSimModal()" style="font-size:13px">${esc(m.sim_number)}</a>`
+    :`<a href="javascript:openSimModal()" style="font-size:12px;color:#b26a00" title="${esc(m.current_imsi)}">未设号码，点击填写</a>`)
+   :'<span style="font-size:12px;color:#999">无卡</span>';
+  // v0.6.0-fix: 取消点击跳转 (#2); 显示 IMEI+运营商 (#3);
+  // 右下角 iOS 开关+信号, 与蜂窝网络页一致 (#4)
+  return `<div style="border:1px solid var(--border);border-radius:10px;padding:12px;min-width:230px;flex:1;max-width:340px;background:#fff">
+   <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+    <span style="width:10px;height:10px;border-radius:50%;background:${dot};display:inline-block"></span>
+    <b style="font-size:15px">${esc(m.alias||m.imei)}</b>${un}</div>
+   <dl class="kv" style="margin:0 0 4px">
+    <dt>IMEI</dt><dd style="font-size:12px">${esc(m.imei||'-')}</dd>
+    <dt>号码</dt><dd>${simHtml}</dd>
+    <dt>运营商</dt><dd>${esc(oper)} · ${reg}</dd>
+    <dt>短信</dt><dd>${m.sms_count||0} 条</dd>
+    <dt>串口</dt><dd style="font-size:12px;color:#999">${esc(m.port||'')}</dd></dl>
+   ${fb}
+   <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+    <div><div id="dash-sig-${m.imei}" style="margin-bottom:2px">${sig}</div>${ip}</div>
+    <div style="display:flex;align-items:center;gap:8px">
+     <span id="dash-tgl-lbl-${m.imei}" style="font-size:13px;color:${conn?'#2e7d32':'var(--muted)'}">${conn?'已上网':'未上网'}</span>
+     <label class="ios-switch"><input type="checkbox" id="dash-tgl-${m.imei}" ${conn?'checked':''} ${m.enabled?'':'disabled'} onchange="dashDataToggle('${m.imei}',this.checked,this)"><span class="slider"></span></label>
+    </div></div>
+  </div>`;}).join('');
+ updateDashSignals();}
+// v0.6.x: 仪表盘信号轮询 (15s), 轻量接口, 与拨号无关
+var _dashModsCache=[];
+async function updateDashSignals(){
+ for(const m of _dashModsCache||[]){
+  if(!m.imei)continue;
+  try{
+   const d=await api('/api/signal?module='+encodeURIComponent(m.imei));
+   if(!d)continue;
+   const el=$('dash-sig-'+m.imei);
+   if(el)el.innerHTML=sigBars(d.loading?null:d.rssi);
+  }catch(e){}
+ }}
+setInterval(()=>{try{if(!$('t-dash').classList.contains('hidden'))updateDashSignals();}catch(e){}},15000);
+// v0.6.0-fix: 卡片开关拨号/断网, 等状态落定再刷新 (#5)
+async function dashDataToggle(imei,on,el){
+ if(el)el.disabled=true;
+ const lbl=$('dash-tgl-lbl-'+imei);
+ if(lbl){lbl.textContent=on?'拨号中…':'断开中…';lbl.style.color='var(--muted)';}
+ const d=await api(on?'/api/data/on':'/api/data/off',{method:'POST',body:JSON.stringify({module:imei})});
+ if(!d||!d.ok){alert((on?'拨号':'断开')+'失败: '+(d&&(d.error||d.msg)||'未知'));loadDash();return;}
+ // 轮询等状态落定 (开:60s / 关:15s), 再刷新卡片
+ const want=!!on, t0=Date.now(), timeout=on?60000:15000;
+ let ok=false;
+ while(Date.now()-t0<timeout){
+  await new Promise(r=>setTimeout(r,2000));
+  try{const dd=await api('/api/dashboard');const mm=(dd.modules||[]).find(x=>x.imei===imei);
+   if(mm&&!!(mm.data&&mm.data.connected)===want){ok=true;break;}}catch(e){}
+ }
+ if(!ok&&lbl)lbl.textContent='状态未确认,请刷新';
+ loadDash();}
 function bar(pct){const c=pct>80?'#e53935':(pct>60?'#fb8c00':'#8bc34a');
  return `<div style="background:#eee;border-radius:4px;height:8px;flex:1"><div style="background:${c};height:8px;border-radius:4px;width:${Math.min(pct,100)}%"></div></div>`;}
 async function loadDashSys(fresh){const d=await api('/api/system'+(fresh?'?fresh=1':''));if(!d)return;
@@ -618,22 +919,53 @@ async function usbUmount(dev){if(!confirm('卸载将同时删除其 Samba 共享
  if(d&&d.ok)loadUsb();else alert('卸载失败: '+(d&&d.error||'未知'));}
 async function sambaShare(path){const d=await api('/api/system/samba/share',{method:'POST',body:JSON.stringify({path})});
  if(d&&d.ok){alert('共享已创建！\n'+d.hint);loadUsb();}else alert('创建失败: '+(d&&d.error||'未知'));}
-async function loadDashModem(){const d=await api('/api/device');if(!d)return;
- if(d.scanning){$('dash-modem').innerHTML='<p class="muted">正在扫描设备信息…</p>';return;}
- const rs={0:'未注册',1:'已注册(本地)',2:'搜索中',3:'被拒绝',5:'已注册(漫游)'}[d.reg?.stat]??'-';
- $('dash-modem').innerHTML=`<div onclick="goTab('device')" style="cursor:pointer"><dl class="kv">
- <dt>型号</dt><dd>${esc(d.model||'-')}</dd>
- <dt>IMEI</dt><dd>${esc(d.imei||'-')}</dd>
- <dt>IMSI</dt><dd>${esc(d.imsi||'-')}</dd>
- <dt>信号</dt><dd>RSSI ${d.signal?.rssi??'-'}</dd>
- <dt>注册</dt><dd>${rs}</dd>
- <dt>运营商</dt><dd>${esc(d.operator?.oper||'-')}</dd>
- <dt>串口</dt><dd>${esc(d.port||'-')}</dd></dl></div>`;}
-let smsMessages=[],currentContact=null;
-async function loadSms(){const d=await api('/api/sms');if(!d)return;
+let smsMessages=[],currentContact=null,_simNumbers=[];
+// v0.6.1: IMSI 为纲. 下拉值: ""=全部号码, "n:号码"=合并, "i:imsi"=未设号码单卡
+function smsSel(){const el=$('sms-number');return (el&&el.value||'').trim();}
+function modAlias(imei){const m=_modules.find(x=>x.imei===imei);return m?(m.alias||imei.slice(-4)):"";}
+async function loadSimNumbers(){
+ const d=await api('/api/sim_numbers');if(!d)return;
+ _simNumbers=d.sim_numbers||[];
+ const nums=new Map();
+ for(const s of _simNumbers){const n=(s.number||'').trim();
+  if(n){if(!nums.has(n))nums.set(n,{imsis:[],loc:null});
+   const g=nums.get(n);g.imsis.push(s.imsi);if(s.current)g.loc=s.current;}}
+ let h='<option value="">📋 全部号码</option>';
+ for(const [n,g] of nums){
+  const loc=g.loc?` · 当前在${g.loc.alias||'模块'}`:' · 未插入';
+  h+=`<option value="n:${esc(n)}">${esc(n)}${g.imsis.length>1?` (${g.imsis.length}卡)`:''}${loc}</option>`;}
+ for(const s of _simNumbers){if((s.number||'').trim())continue;
+  const loc=s.current?` · 当前在${s.current.alias||'模块'}`:' · 未插入';
+  h+=`<option value="i:${esc(s.imsi)}">${esc(s.imsi.slice(-8))} (未设号码)${loc}</option>`;}
+ const el=$('sms-number');const cur=el.value;
+ el.innerHTML=h;
+ if(cur&&[...el.options].some(o=>o.value===cur))el.value=cur;
+ updateSmsLoc();
+ const w=$('sms-unassigned-warn');
+ if(w)w.innerHTML=d.unassigned?
+  `<div class="card" style="padding:10px;margin-bottom:12px;border:1px solid #e8a33d">⚠️ 有 ${d.unassigned} 条老短信未归属号码，<a href="javascript:openSimModal()">打开号码管理手动归属</a></div>`:'';
+}
+function updateSmsLoc(){
+ const el=$('sms-number-loc');if(!el)return;
+ const v=smsSel();let t='';
+ if(v.startsWith('n:')){const n=v.slice(2);
+  const loc=_simNumbers.find(s=>(s.number||'').trim()===n&&s.current);
+  t=loc?`当前在 ${esc(loc.current.alias||'模块')}`:'卡未插入';}
+ else if(v.startsWith('i:')){const s=_simNumbers.find(x=>x.imsi===v.slice(2));
+  t=s&&s.current?`当前在 ${esc(s.current.alias||'模块')}`:'卡未插入';}
+ el.textContent=t;
+}
+async function loadSms(){const v=smsSel();
+ let q='';
+ if(v.startsWith('n:'))q='?number='+encodeURIComponent(v.slice(2));
+ else if(v.startsWith('i:'))q='?imsi='+encodeURIComponent(v.slice(2));
+ const d=await api('/api/sms'+q);if(!d)return;
+ const body=v.startsWith('n:')?{number:v.slice(2)}:v.startsWith('i:')?{imsi:v.slice(2)}:{};
+ api('/api/sms/read',{method:'POST',body:JSON.stringify(body)});
  smsMessages=d.messages;
  renderContacts();
- if(currentContact)renderConversation(currentContact);}
+ if(currentContact)renderConversation(currentContact);
+ updateSmsLoc();}
 function getContacts(){
  const map=new Map();
  for(const m of smsMessages){
@@ -672,9 +1004,10 @@ function renderConversation(num){
  $('conv-messages').innerHTML=msgs.length?msgs.map(m=>{
   const t=m.sms_time||m.created_at||'';
   const lim=smsLimit(m.body||'');
+  const ma=m.module_id?modAlias(m.module_id):'';
   return `<div style="display:flex;flex-direction:column;position:relative">
    <div class="bubble ${m.direction==='in'?'in':'out'}">${esc(m.body)}
-   <div class="time">${esc(t)}  ${m.body?.length||0}/${lim}
+   <div class="time">${esc(t)}${ma?` · ${esc(ma)}`:''}  ${m.body?.length||0}/${lim}
    <a href="javascript:deleteMsg(${m.id})" style="margin-left:6px;opacity:.6" title="删除">✕</a></div></div></div>`;}).join('')
   :'<div style="text-align:center;color:var(--muted);padding:40px">暂无消息，输入内容发送吧</div>';
  const el=$('conv-messages');el.scrollTop=el.scrollHeight;
@@ -702,18 +1035,93 @@ async function importBackup(input){const f=input.files[0];if(!f)return;
  input.value='';}
 async function sendSms(){const to=(currentContact||$('sms-to').value.trim()),text=$('sms-text').value;
  if(!to||!text)return alert('选择联系人并填写内容');
+ // v0.6.1: 按号码发, 自动路由到该号码当前所在模块
+ const v=smsSel();const body={to,text};
+ if(v.startsWith('n:'))body.number=v.slice(2);
+ else if(v.startsWith('i:')){const s=_simNumbers.find(x=>x.imsi===v.slice(2));
+  if(s&&s.current)body.module=s.current.imei;}
  $('sms-send-status').textContent='发送中…';
- const d=await api('/api/sms/send',{method:'POST',body:JSON.stringify({to,text})});
+ const d=await api('/api/sms/send',{method:'POST',body:JSON.stringify(body)});
  $('sms-send-status').textContent=d&&d.ok?'✅ 已发送':'❌ '+(d&&d.error||'失败');
  if(d&&d.ok){$('sms-text').value='';$('sms-text').style.height='auto';currentContact=to;setTimeout(loadSms,1000);}}
-async function loadDevice(fresh){const d=await api('/api/device'+(fresh?'?fresh=1':''));if(!d)return;
+// v0.6.0: 模块管理
+let _modules=[];
+async function loadModules(){
+ const d=await api('/api/modules');if(!d)return;
+ _modules=d.modules||[];
+ const box=$('module-list');
+ if(!_modules.length){box.innerHTML='<p class="muted">暂无模块，点击「扫描串口」添加</p>';}
+ else box.innerHTML=_modules.map(m=>
+  `<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+   <div><b>${esc(m.alias||m.imei)}</b> <span style="color:#999;font-size:12px">${esc(m.imei)}</span><br>
+   <span style="font-size:12px;color:#666">${esc(m.port||'')} · ${esc(m.model||m.profile||'')}</span>
+   ${m.enabled?'':' <span class="badge bad">已停用</span>'}</div>
+   <div style="display:flex;gap:6px">
+    <button class="btn ghost" style="font-size:12px;padding:2px 10px" onclick="renameModule('${m.imei}')">改名</button>
+    <button class="btn ghost" style="font-size:12px;padding:2px 10px" onclick="toggleModule('${m.imei}',${m.enabled?0:1})">${m.enabled?'停用':'启用'}</button>
+    <button class="btn danger" style="font-size:12px;padding:2px 10px" onclick="delModule('${m.imei}')">删除</button>
+   </div></div>`).join('');
+ refreshModuleSelectors();}
+async function openScan(){
+ const box=$('scan-result');box.innerHTML='<p class="muted">正在扫描串口…</p>';
+ const d=await api('/api/modules/scan',{method:'POST'});
+ if(!d||!d.ok){box.innerHTML='<p style="color:#c00">扫描失败: '+esc(d&&d.error||'未知')+'</p>';return;}
+ const ports=d.ports||[];
+ if(!ports.length){box.innerHTML='<p class="muted">未发现串口设备</p>';return;}
+ box.innerHTML='<div style="font-size:13px;margin-bottom:6px">发现 '+ports.length+' 个串口：</div>'+ports.map(p=>{
+  if(p.locked)return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:13px">
+   <b>${esc(p.port)}</b> <span class="badge bad">被占用</span>
+   <span style="color:#666">占用者: ${esc(p.locked_by||'未知')}</span><br>
+   <span style="font-size:12px;color:#999">请自行检查占用进程，或换一个端口（不会自动 kill 任何进程）</span></div>`;
+  const info=[p.manufacturer,p.model,p.revision].filter(Boolean).join(' ');
+  const imei=p.imei||'未知IMEI';
+  const reg=p.registered?' <span class="badge ok">已注册</span>':'';
+  const fb=p.fallback?'<br><span style="font-size:12px;color:#b26a00">⚠️ 未识别型号，将按 EC20 兼容模式运行</span>':'';
+  const btn=p.registered?'':` <button class="btn" style="font-size:12px;padding:2px 10px" onclick="addModule('${esc(p.port)}')">添加</button>`;
+  return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:13px">
+   <b>${esc(p.port)}</b>${reg}<br>
+   <span style="color:#666">${esc(info||'无响应')}</span> · IMEI ${esc(imei)}${fb}<br>${btn}</div>`;}).join('');}
+async function addModule(port){
+ const alias=prompt('给模块起个别名 (可空, 默认按型号+IMEI后4位):','')||'';
+ const d=await api('/api/modules/add',{method:'POST',body:JSON.stringify({port,alias})});
+ if(d&&d.ok){alert('已添加: '+(d.imei||''));loadModules();openScan();}
+ else alert('添加失败: '+(d&&(d.error+(d.locked_by?'\n占用者: '+d.locked_by:'')+(d.hint?'\n'+d.hint:''))||'未知'));}
+async function delModule(imei){
+ if(!confirm('删除模块 '+imei+'？\n历史短信会保留，只停止轮询。'))return;
+ const d=await api('/api/modules/'+encodeURIComponent(imei),{method:'DELETE'});
+ if(d&&d.ok)loadModules();else alert('删除失败');}
+async function renameModule(imei){
+ const cur=(_modules.find(m=>m.imei===imei)||{}).alias||'';
+ const alias=prompt('新别名:',cur);if(alias==null)return;
+ const d=await api('/api/modules/'+encodeURIComponent(imei)+'/alias',{method:'POST',body:JSON.stringify({alias})});
+ if(d&&d.ok)loadModules();else alert('改名失败');}
+async function toggleModule(imei,on){
+ const d=await api('/api/modules/'+encodeURIComponent(imei)+'/enable',{method:'POST',body:JSON.stringify({enable:!!on})});
+ if(d&&d.ok){alert(d.note||'已执行');loadModules();}else alert('失败');}
+// v0.6.0-fix: 取各标签页当前选中的模块 IMEI (下拉框值)
+function dataMod(){const el=$('data-module');return (el&&el.value||'').trim();}
+function atMod(){const el=$('at-module');return (el&&el.value||'').trim();}
+// 拼 module 查询参数: 空 IMEI 返回空串 (后端自动用第一个启用模块兜底)
+function modQ(imei){return imei?('?module='+encodeURIComponent(imei)):'';}
+// 所有模块下拉框同步
+function refreshModuleSelectors(){
+ const opts=_modules.filter(m=>m.enabled).map(m=>
+  `<option value="${esc(m.imei)}">${esc(m.alias||m.imei)}</option>`).join('');
+ ['device-module','data-module','at-module'].forEach(id=>{
+  const el=$(id);if(!el)return;
+  const cur=el.value;el.innerHTML=opts||'<option value="">(无模块)</option>';
+  if(cur&&[...el.options].some(o=>o.value===cur))el.value=cur;});}
+async function loadDevice(fresh){
+ const modSel=$('device-module');const imei=modSel&&modSel.value?modSel.value:'';
+ const q=(fresh?'?fresh=1':'')+(imei?((fresh?'&':'?')+'module='+encodeURIComponent(imei)):'');
+ const d=await api('/api/device'+q);if(!d)return;
  // v0.5.8-fix: 后台还没扫完时显示占位, 不闪空值
  if(d.scanning){$('device-info').innerHTML='<p class="muted">正在扫描设备信息…</p>';return;}
  const r=d.reg||{};const regTxt={0:'未注册',1:'已注册(本地)',2:'搜索中',3:'被拒绝',5:'已注册(漫游)'}[r.stat]??('stat='+r.stat);
  $('device-info').innerHTML=`<dl class="kv">
  <dt>IMEI</dt><dd>${esc(d.imei)}</dd><dt>IMSI</dt><dd>${esc(d.imsi)}</dd>
  <dt>ICCID</dt><dd>${esc(d.iccid)}</dd><dt>信号</dt><dd>RSSI ${d.signal?.rssi??'-'} ${d.signal&&d.signal.rssi<=31?'<span class="badge '+(d.signal.rssi>=15?'ok':'bad')+'">'+(d.signal.rssi>=15?'良好':'较弱')+'</span>':''}</dd>
- <dt>注册</dt><dd>${regTxt}</dd><dt>运营商</dt><dd>${esc(d.operator?.oper||'-')}</dd>
+ <dt>注册</dt><dd>${regTxt}</dd><dt>运营商</dt><dd>${esc(d.carrier||d.operator?.oper||'-')}</dd>
  <dt>串口</dt><dd>${esc(d.port)} <button class="btn ghost" style="font-size:12px;padding:2px 8px" onclick="editPort('${esc(d.port)}')">修改</button></dd></dl>
  <div id="port-edit" style="display:none;margin-top:8px"><div class="row">
  <input id="port-input" placeholder="/dev/ttyUSB3" style="flex:2">
@@ -743,12 +1151,19 @@ async function loadData(fresh){const d=await api('/api/data'+(fresh?'?fresh=1':'
  updateDataSignal();
  loadCarrier();loadUsbnetMode();loadImplNotes();}
 async function updateDataSignal(){
- const d=await api('/api/device');if(!d)return;
- const r=d.signal?.rssi,bars=$('data-signal').children;
+ // v0.6.x: 轻量信号接口 (AT+CSQ 缓存, 20s 刷一次, 与拨号无关)
+ const d=await api('/api/signal'+modQ(dataMod()));if(!d)return;
+ const r=d.rssi,bars=$('data-signal').children;
  let n=0;
- if(typeof r==='number'&&r<=31)n=r>=25?5:r>=20?4:r>=15?3:r>=10?2:r>=1?1:0;
+ if(typeof r==='number'&&r!==99&&r<=31)n=r>=25?5:r>=20?4:r>=15?3:r>=10?2:r>=1?1:0;
  for(let i=0;i<bars.length;i++)bars[i].classList.toggle('on',i<n);
- $('data-signal-text').textContent=(typeof r==='number'&&r<=31)?('RSSI '+r):'无信号';}
+ const txt=$('data-signal-text');
+ if(d.loading)txt.textContent='读取中…';
+ else if(r===99)txt.textContent='无信号';
+ else if(typeof r==='number'&&r<=31)txt.textContent='RSSI '+r;
+ else txt.textContent='无信号';}
+// v0.6.x: 信号轮询 (10s), 打开页面即有, 与拨号状态无关
+setInterval(()=>{try{if(!$('t-data').classList.contains('hidden'))updateDataSignal();}catch(e){}},10000);
 async function toggleData(on){
  const tg=$('data-toggle');tg.disabled=true;window._dataBusy=true;
  try{
@@ -756,7 +1171,7 @@ async function toggleData(on){
  else{await dataOff();}
  }finally{window._dataBusy=false;tg.disabled=false;}}
 async function dataOn(){$('data-info').innerHTML='连接中…(约10-20秒)';
- const d=await api('/api/data/on',{method:'POST'});
+ const d=await api('/api/data/on',{method:'POST',body:JSON.stringify({module:dataMod()})});
  if(d&&d.ok){
    if(d.dialing){
      $('data-info').innerHTML='正在拨号…';
@@ -774,16 +1189,16 @@ async function dataOn(){$('data-info').innerHTML='连接中…(约10-20秒)';
 async function waitDataState(want,timeoutMs){
  const t0=Date.now();
  while(Date.now()-t0<timeoutMs){
-   try{const d=await api('/api/data?fresh=1');
+   try{const _m=dataMod();const d=await api('/api/data?fresh=1'+(_m?('&module='+encodeURIComponent(_m)):''));
      if(d&&!!d.connected===want)return true;
    }catch(e){}
    await new Promise(r=>setTimeout(r,1500));
  }
  return false;}
-async function clearIpChange(){await api('/api/data/ipchange/clear',{method:'POST'});loadData();}
+async function clearIpChange(){await api('/api/data/ipchange/clear',{method:'POST',body:JSON.stringify({module:dataMod()})});loadData();}
 // 三段式连通性: bearer -> IP -> 互联网
 async function testConnectivity(){$('conn-result').innerHTML='测试中…(约10秒)';
- const d=await api('/api/data/connectivity');if(!d||d.error){$('conn-result').innerHTML='测试失败';return;}
+ const d=await api('/api/data/connectivity'+modQ(dataMod()));if(!d||d.error){$('conn-result').innerHTML='测试失败';return;}
  const b1=d.bearer?'<span class="badge ok">✅ 已建立</span>':'<span class="badge bad">❌ 未建立</span>';
  const b2=(d.has_ipv4||d.has_ipv6)?'<span class="badge ok">✅ 已获取</span>':'<span class="badge bad">❌ 未获取</span>';
  const v4txt=d.internet_v4===null?'-':(d.internet_v4?'<span class="badge ok">✅ 通</span>':'<span class="badge bad">❌ 不通</span>');
@@ -797,7 +1212,7 @@ async function testConnectivity(){$('conn-result').innerHTML='测试中…(约10
  $('data-stages').innerHTML='';}
 // 操作日志折叠
 function toggleOpLog(){const b=$('oplog-box');b.style.display=b.style.display==='none'?'block':'none';if(b.style.display==='block')loadOpLog();}
-async function loadOpLog(){const d=await api('/api/data/oplog');if(!d)return;
+async function loadOpLog(){const d=await api('/api/data/oplog'+modQ(dataMod()));if(!d)return;
  $('oplog-output').textContent=(d.logs||[]).join('\n')||'(空)';}
 // 修改账户
 async function openAccountModal(){const d=await api('/api/account');if(d&&d.username)$('acc-username').value=d.username;
@@ -815,7 +1230,7 @@ async function submitAccountChange(){
  else{$('acc-msg').textContent=d&&(d.error||'失败');}}
 async function dataOff(){
  $('data-info').innerHTML='正在断开…';
- const d=await api('/api/data/off',{method:'POST'});
+ const d=await api('/api/data/off',{method:'POST',body:JSON.stringify({module:dataMod()})});
  if(d&&d.ok){
    // v0.5.8: fresh 轮询直到真正断开, 开关与执行同步
    await waitDataState(false,15000);
@@ -825,11 +1240,11 @@ async function dataOff(){
  }}
 async function pingTest(){const t=$('ping-target').value.trim()||'2400:3200::1';
  $('ping-result').innerHTML='测试中…';
- const d=await api('/api/data/ping',{method:'POST',body:JSON.stringify({target:t})});
+ const d=await api('/api/data/ping',{method:'POST',body:JSON.stringify({target:t,module:dataMod()})});
  $('ping-result').innerHTML=d?`<dl class="kv"><dt>目标</dt><dd>${esc(t)}</dd>
  <dt>结果</dt><dd>${d.ok?'<span class="badge ok">通</span>':'<span class="badge bad">不通</span>'}</dd>
  <dt>平均时延</dt><dd>${d.avg_ms} ms</dd><dt>丢包</dt><dd>${d.loss_pct}%</dd></dl>`:'失败';}
-async function loadCarrier(){const d=await api('/api/data/carrier');if(!d||!d.ok)return;
+async function loadCarrier(){const d=await api('/api/data/carrier'+modQ(dataMod()));if(!d||!d.ok)return;
  $('carrier-info').innerHTML=`<dl class="kv">
  <dt>运营商</dt><dd>${esc(d.carrier||'-')}</dd><dt>IMSI</dt><dd>${esc(d.imsi||'-')}</dd>
  <dt>网络</dt><dd>${esc(d.operator||'-')}</dd><dt>识别APN</dt><dd>${esc(d.apn||'-')}</dd>
@@ -837,9 +1252,9 @@ async function loadCarrier(){const d=await api('/api/data/carrier');if(!d||!d.ok
  <dt>来源</dt><dd>${esc(d.source||'-')}</dd></dl>`;
  if(d.apn)$('apn-input').value=d.apn;}
 async function setApn(){const a=$('apn-input').value.trim();if(!a){alert('APN 不能为空');return;}
- const d=await api('/api/data/apn',{method:'POST',body:JSON.stringify({apn:a})});
+ const d=await api('/api/data/apn',{method:'POST',body:JSON.stringify({apn:a,module:dataMod()})});
  alert(d&&d.ok?'APN 已下发到模块':'失败: '+(d&&d.error));}
-async function loadUsbnetMode(){const d=await api('/api/data/mode');if(!d||!d.ok)return;
+async function loadUsbnetMode(){const d=await api('/api/data/mode'+modQ(dataMod()));if(!d||!d.ok)return;
  $('usbnet-mode').textContent=d.name+' ('+d.mode+')';}
 const IMPL_NOTES=`【ECM 模式上网实现】(2026-10-08 N1 实测)
 # 1. 模块设为 ECM 模式 (只需做一次)
@@ -861,12 +1276,12 @@ async function loadImplNotes(){$('impl-notes').textContent=IMPL_NOTES;}
 function copyImpl(){navigator.clipboard.writeText(IMPL_NOTES).then(()=>alert('已复制'),()=>alert('复制失败'));}
 async function ussdSend(){const c=$('ussd-code').value.trim();if(!c)return;
  $('ussd-result').textContent='发送中…';
- const d=await api('/api/ussd',{method:'POST',body:JSON.stringify({code:c})});
+ const d=await api('/api/ussd',{method:'POST',body:JSON.stringify({code:c,module:atMod()})});
  $('ussd-result').textContent=(d&&d.ok?d.response:'❌ '+(d&&d.error||'失败'));}
-async function ussdCancel(){await api('/api/ussd/cancel',{method:'POST'});$('ussd-result').textContent='已取消';}
+async function ussdCancel(){await api('/api/ussd/cancel',{method:'POST',body:JSON.stringify({module:atMod()})});$('ussd-result').textContent='已取消';}
 async function atSend(){const c=$('at-cmd').value.trim();if(!c)return;
  $('at-result').textContent='执行中…';
- const d=await api('/api/at',{method:'POST',body:JSON.stringify({cmd:c})});
+ const d=await api('/api/at',{method:'POST',body:JSON.stringify({cmd:c,module:atMod()})});
  $('at-result').textContent=d?(d.lines||[]).join('\n'):'失败';}
 async function loadEc20(){const d=await api('/api/ec20');if(!d)return;
  let h='<h3>通用规格</h3><dl class="kv">';
@@ -903,7 +1318,7 @@ document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',
 }));
 // v0.5.7: 拨号步骤实时显示
 let dialogTimer=null;
-async function loadDialog(){const d=await api('/api/data/oplog');if(!d)return;
+async function loadDialog(){const d=await api('/api/data/oplog'+modQ(dataMod()));if(!d)return;
  const el=$('dialog-output');
  // v0.5.8: 只有用户已在底部才自动滚到底, 避免阅读时跳变
  const nearBottom=el.scrollHeight-el.scrollTop-el.clientHeight<40;
@@ -913,7 +1328,7 @@ async function loadDialog(){const d=await api('/api/data/oplog');if(!d)return;
  if(typeof loadData==='function'){try{await loadData();}catch(e){}}
 }
 function toggleDialogAuto(){if($('dialog-auto').checked){dialogTimer=setInterval(loadDialog,3000);}else{clearInterval(dialogTimer);dialogTimer=null;}}
-async function clearDialog(){await api('/api/data/oplog/clear',{method:'POST'});loadDialog();}
+async function clearDialog(){await api('/api/data/oplog/clear',{method:'POST',body:JSON.stringify({module:dataMod()})});loadDialog();}
 document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>{
  if(b.dataset.t==='data'){loadDialog();if($('dialog-auto').checked&&!dialogTimer)dialogTimer=setInterval(loadDialog,3000);}
  if(b.dataset.t!=='data'&&dialogTimer){clearInterval(dialogTimer);dialogTimer=null;}
@@ -950,6 +1365,41 @@ async function loadQQOpenids(){const d=await api('/api/qq/openids');
  $('qq-openids').innerHTML=h||'<p style="color:var(--muted)">暂无。用 QQ 给机器人发条消息后点刷新。</p>';}
 function fillQQOpenid(id){const inp=document.querySelector('#notify-form input[data-n="qq"][data-k="openid"]');
  if(inp){inp.value=id;$('notify-status').textContent='已填入，点保存生效';}}
+// v0.6.1: 号码管理弹窗 (IMSI->号码, 自助增删改)
+function openSimModal(){$('sim-modal').style.display='flex';loadSimModal();}
+function closeSimModal(){$('sim-modal').style.display='none';}
+async function loadSimModal(){
+ const d=await api('/api/sim_numbers');if(!d)return;
+ _simNumbers=d.sim_numbers||[];
+ const box=$('sim-modal-list');
+ box.innerHTML=_simNumbers.length?_simNumbers.map(s=>`
+  <div class="row" style="align-items:center;padding:10px 0;border-bottom:1px solid var(--border);gap:8px;flex-wrap:wrap">
+   <div style="min-width:170px"><b>${esc(s.number||'(未设号码)')}</b>
+    <div class="muted" style="font-size:11px">IMSI ${esc(s.imsi)}</div></div>
+   <input id="simn-${esc(s.imsi)}" value="${esc(s.number||'')}" placeholder="填写号码" style="width:140px">
+   <input id="sima-${esc(s.imsi)}" value="${esc(s.alias||'')}" placeholder="备注" style="width:100px">
+   <button class="btn" onclick="saveSim('${esc(s.imsi)}')">保存</button>
+   <span class="muted" style="font-size:12px">${s.current?('📶 '+(s.current.alias||'模块')):'○ 未插入'}</span>
+  </div>`).join('')
+  :'<p class="muted">暂无 IMSI 记录。模块通电读到 IMSI 后会自动出现在这里。</p>';
+ const w=$('sim-modal-warn');
+ if(w)w.innerHTML=d.unassigned?
+  `<div style="padding:10px;margin-bottom:12px;border:1px solid #e8a33d;border-radius:8px;font-size:13px">⚠️ 有 ${d.unassigned} 条老短信未归属号码：
+   <select id="assign-imsi" style="max-width:220px">${_simNumbers.map(s=>`<option value="${esc(s.imsi)}">${esc(s.number||s.imsi.slice(-8))}</option>`).join('')}</select>
+   <button class="btn" onclick="assignUnassigned()">一键归属</button></div>`:'';
+}
+async function saveSim(imsi){
+ const number=$('simn-'+imsi).value.trim(),alias=$('sima-'+imsi).value.trim();
+ const d=await api('/api/sim_numbers',{method:'POST',body:JSON.stringify({imsi,number,alias})});
+ if(d&&d.ok){loadSimModal();loadSimNumbers();}else alert('保存失败');}
+async function assignUnassigned(){
+ const imsi=$('assign-imsi').value;if(!imsi)return;
+ if(!confirm('把全部未归属老短信归到该 IMSI？'))return;
+ const d=await api('/api/sim_numbers/assign',{method:'POST',body:JSON.stringify({imsi})});
+ alert(d&&d.ok?`✅ 已归属 ${d.count} 条`:'❌ '+(d&&d.error||'失败'));
+ loadSimModal();}
+// v0.6.0: 启动时加载模块列表, 同步所有模块下拉框
+loadModules().then(()=>{refreshModuleSelectors();loadSimNumbers();});
 loadDash();
 </script></body></html>
 """
@@ -990,8 +1440,28 @@ try{
 @requires_auth
 def api_sms():
     db = get_store()
-    rows = db.execute(
-        "SELECT * FROM sms ORDER BY id DESC LIMIT 100").fetchall()
+    # v0.6.1: IMSI 为纲. ?number=<号码>(合并名下多 IMSI, 补卡场景)
+    #         ?imsi=<imsi>(未设号码的单 IMSI) / 不传=全部, 按时间排
+    number = request.args.get("number", "").strip()
+    imsi = request.args.get("imsi", "").strip()
+    if number:
+        rows = db.execute(
+            "SELECT imsi FROM sim_numbers WHERE number=?", (number,)).fetchall()
+        imsis = [r["imsi"] for r in rows]
+        if imsis:
+            ph = ",".join("?" * len(imsis))
+            rows = db.execute(
+                f"SELECT * FROM sms WHERE imsi IN ({ph})"
+                " ORDER BY id DESC LIMIT 200", imsis).fetchall()
+        else:
+            rows = []
+    elif imsi:
+        rows = db.execute(
+            "SELECT * FROM sms WHERE imsi=? ORDER BY id DESC LIMIT 200",
+            (imsi,)).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM sms ORDER BY id DESC LIMIT 200").fetchall()
     db.close()
     msgs = []
     for r in rows:
@@ -1017,21 +1487,49 @@ def api_sms():
 def api_sms_send():
     data = request.get_json(force=True)
     to, text = data.get("to", "").strip(), data.get("text", "")
+    # v0.6.1: 按号码发, 自动路由到该号码当前所在模块 (module 参数保留兼容)
+    number = (data.get("number") or "").strip()
+    imei = (data.get("module") or "").strip() or None
+    send_imsi = ""
     if not to or not text:
         return jsonify({"ok": False, "error": "号码和内容必填"})
+    if number and not imei:
+        db = get_store()
+        try:
+            rows = db.execute(
+                "SELECT imsi FROM sim_numbers WHERE number=?",
+                (number,)).fetchall()
+            imsis = [r["imsi"] for r in rows]
+            for m in list_modules():
+                if not m.get("enabled", 1):
+                    continue
+                ci = (m.get("current_imsi") or "").strip()
+                if ci and ci in imsis:
+                    imei, send_imsi = m["imei"], ci
+                    break
+        finally:
+            db.close()
+        if not imei:
+            return jsonify({"ok": False,
+                            "error": f"号码 {number} 的卡当前未插入任何模块"})
     try:
-        m = get_modem()
+        m = get_modem(imei)
         try:
             mr = m.sms_send(to, text)
         finally:
             m.close()
-        # Save to DB
+        # Save to DB (带 module_id + imsi)
+        mod = _get_module(imei)
         db = get_store()
-        db.execute(
-            "INSERT INTO sms (direction,sender,body,forwarded)"
-            " VALUES ('out',?,?,1)", (to, text))
-        db.commit()
-        db.close()
+        try:
+            db.execute(
+                "INSERT INTO sms (direction,sender,body,forwarded,module_id,imsi)"
+                " VALUES ('out',?,?,1,?,?)",
+                (to, text, mod["imei"] if mod else "",
+                 send_imsi or (mod.get("current_imsi", "") if mod else "")))
+            db.commit()
+        finally:
+            db.close()
         return jsonify({"ok": True, "mr": mr})
     except ModemError as e:
         return jsonify({"ok": False, "error": str(e)})
@@ -1041,13 +1539,88 @@ def api_sms_send():
 
 
 # ----------------------------------------------------------------------
+# v0.6.1: IMSI->号码映射 (用户自助增删改)
+# ----------------------------------------------------------------------
+@app.route("/api/sim_numbers")
+@requires_auth
+def api_sim_numbers():
+    """IMSI 列表 + 号码映射, 附带每个 IMSI 当前所在模块."""
+    db = get_store()
+    try:
+        sims = [dict(r) for r in db.execute(
+            "SELECT imsi, number, alias, updated_at FROM sim_numbers"
+            " ORDER BY number, imsi").fetchall()]
+        loc = {}
+        for m in list_modules():
+            ci = (m.get("current_imsi") or "").strip()
+            if ci:
+                loc[ci] = {"imei": m["imei"], "alias": m.get("alias", ""),
+                           "port": m.get("port", "")}
+        out = []
+        for s in sims:
+            s["current"] = loc.get(s["imsi"])
+            out.append(s)
+        # 未归属老短信数 (imsi 为空, 提示用户手动归属)
+        c = db.execute("SELECT COUNT(*) c FROM sms WHERE imsi='' OR imsi IS NULL"
+                       ).fetchone()["c"]
+        return jsonify({"sim_numbers": out, "unassigned": c})
+    finally:
+        db.close()
+
+
+@app.route("/api/sim_numbers", methods=["POST"])
+@requires_auth
+def api_sim_number_upsert():
+    data = request.get_json(force=True) or {}
+    imsi = (data.get("imsi") or "").strip()
+    if not imsi:
+        return jsonify({"ok": False, "error": "imsi 必填"})
+    db = get_store()
+    try:
+        db.execute(
+            """INSERT INTO sim_numbers (imsi, number, alias, updated_at)
+               VALUES (?,?,?,CURRENT_TIMESTAMP)
+               ON CONFLICT(imsi) DO UPDATE SET
+                 number=excluded.number, alias=excluded.alias,
+                 updated_at=CURRENT_TIMESTAMP""",
+            (imsi, (data.get("number") or "").strip(),
+             (data.get("alias") or "").strip()))
+        db.commit()
+    finally:
+        db.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sim_numbers/assign", methods=["POST"])
+@requires_auth
+def api_sim_number_assign():
+    """v0.6.1: 老短信 imsi 为空且有歧义时, 用户手动一键归属到某 IMSI."""
+    data = request.get_json(force=True) or {}
+    imsi = (data.get("imsi") or "").strip()
+    if not imsi:
+        return jsonify({"ok": False, "error": "imsi 必填"})
+    db = get_store()
+    try:
+        cur = db.execute("UPDATE sms SET imsi=? WHERE imsi='' OR imsi IS NULL",
+                         (imsi,))
+        db.commit()
+        return jsonify({"ok": True, "count": cur.rowcount})
+    finally:
+        db.close()
+
+
+# ----------------------------------------------------------------------
 # Device API
 # ----------------------------------------------------------------------
-def _scan_device():
+def _scan_device(imei=None):
     """实时扫描设备信息 (AT 指令, 慢, 供缓存系统调用)."""
-    info = {"port": config.get("modem", {}).get("port", "")}
+    mod = _get_module(imei)
+    info = {"port": (mod.get("port") if mod else None) or
+            config.get("modem", {}).get("port", ""),
+            "imei": mod.get("imei", "") if mod else "",
+            "alias": mod.get("alias", "") if mod else ""}
     try:
-        m = get_modem()
+        m = get_modem(imei)
         try:
             for fn, key in (("get_imei", "imei"), ("get_imsi", "imsi"),
                             ("get_iccid", "iccid"),
@@ -1063,6 +1636,39 @@ def _scan_device():
             m.close()
     except ModemError as e:
         info["error"] = str(e)
+    # v0.6.0-fix: 运营商兜底链: COPS 名 -> IMSI(MCCMNC)查 apn_db -> '-'
+    # (AT+COPS? 可能返回数字格式或空, 用 IMSI 精确映射中文名)
+    # apn_db 的 carrier 是 APN 风格名, 转中文显示
+    # 显示格式: "中文 英文", 无中文则只显示英文
+    CARRIER_ZH = {"cmnet": "中国移动", "uninet": "中国联通",
+                  "ctnet": "中国电信", "cbnet": "中国广电"}
+    try:
+        from apn_db import detect_carrier
+        imsi = info.get("imsi", "")
+        if not isinstance(imsi, str) or imsi.startswith("error"):
+            imsi = ""
+        oper = info.get("operator", {})
+        oper_name = oper.get("oper", "") if isinstance(oper, dict) else ""
+        hit = detect_carrier(imsi=imsi, cops_name=oper_name)
+        raw = hit["carrier"] if hit else ""
+        zh = CARRIER_ZH.get(raw.lower(), "")
+        # 英文取 COPS 原名 (纯数字的 MCCMNC 不要)
+        en = oper_name if oper_name and not oper_name.isdigit() else ""
+        if zh and en:
+            info["carrier"] = f"{zh} {en}"
+        elif zh:
+            info["carrier"] = zh
+        elif en:
+            info["carrier"] = en
+        elif oper_name:
+            # 都没有: 显示 COPS 取回的原值 (哪怕是数字格式, 也比空有用)
+            info["carrier"] = oper_name
+        else:
+            info["carrier"] = ""
+        info["carrier_source"] = hit["source"] if hit else ""
+    except Exception:
+        info["carrier"] = ""
+        info["carrier_source"] = ""
     return info
 
 
@@ -1070,14 +1676,40 @@ def _scan_device():
 @requires_auth
 def api_device():
     # v0.5.6: ?fresh=1 强制实时扫描, 否则返回缓存秒回
+    # v0.6.0: ?module=<imei> 指定模块
+    # v0.6.0-fix: 不传 module 时按首个启用模块查缓存 (否则 key 对不上, 永远 miss)
+    imei = _req_module()
+    if not imei:
+        mod = _get_module(None)
+        imei = mod["imei"] if mod and mod.get("imei") else None
+    key = f"device:{imei or 'default'}"
     if request.args.get("fresh") == "1":
-        data = _scan_device()
-        _cache_set("device", data)
+        data = _scan_device(imei)
+        _cache_set(key, data)
         return jsonify(data)
-    data = _cache_get("device")
+    data = _cache_get(key)
     if data is None:
         # v0.5.8-fix: 缓存为空时不阻塞等 AT, 先返回占位, 后台线程会补上
         return jsonify({"port": "", "scanning": True})
+    return jsonify(data)
+
+
+@app.route("/api/signal")
+@requires_auth
+def api_signal():
+    """v0.6.x: 轻量信号接口 (AT+CSQ 缓存, 20s 刷一次).
+
+    信号是无线电测量, 与拨号状态无关. 缓存未命中返回 loading 占位,
+    前端轮询直到拿到数据. rssi=99 为 modem 明确报告无信号.
+    """
+    imei = _req_module()
+    if not imei:
+        mod = _get_module(None)
+        imei = mod["imei"] if mod and mod.get("imei") else None
+    key = f"signal:{imei or 'default'}"
+    data = _cache_get(key)
+    if data is None:
+        return jsonify({"rssi": None, "ber": None, "loading": True})
     return jsonify(data)
 
 
@@ -1086,7 +1718,7 @@ def api_device():
 def api_flight():
     enable = request.get_json(force=True).get("enable", False)
     try:
-        m = get_modem()
+        m = get_modem(_req_module())
         try:
             m.set_flight_mode(enable)
         finally:
@@ -1099,35 +1731,41 @@ def api_flight():
 # ----------------------------------------------------------------------
 # Data API
 # ----------------------------------------------------------------------
-def _scan_data():
+def _scan_data(imei=None):
     """实时扫描数据状态 (QMI, 供缓存系统调用)."""
-    return get_data_ctl().get_status()
+    return get_data_ctl(imei).get_status()
 
 
 @app.route("/api/data")
 @requires_auth
 def api_data():
     # v0.5.6: ?fresh=1 强制实时扫描, 否则返回缓存秒回
+    # v0.6.0-fix: 缓存按模块隔离 (多模块各查各的)
+    imei = _req_module()
+    if not imei:
+        mod = _get_module(None)
+        imei = mod["imei"] if mod and mod.get("imei") else None
+    key = f"data:{imei or 'default'}"
     if request.args.get("fresh") == "1":
-        data = _scan_data()
-        _cache_set("data", data)
+        data = _scan_data(imei)
+        _cache_set(key, data)
         return jsonify(data)
-    data = _cache_get("data")
+    data = _cache_get(key)
     if data is None:
-        data = _scan_data()
-        _cache_set("data", data)
+        data = _scan_data(imei)
+        _cache_set(key, data)
     return jsonify(data)
 
 
 @app.route("/api/data/on", methods=["POST"])
 @requires_auth
 def api_data_on():
-    ctl = get_data_ctl()
+    ctl = get_data_ctl(_req_module())
     # v0.5.7: 先自动识别 APN (IMSI->APN 库), 不行再用配置的手写值
     auto_apn = ""
     auto_carrier = ""
     try:
-        m = _get_modem_for_data()
+        m = _get_modem_for_data(_req_module())
         try:
             info = get_carrier_info(m)
         finally:
@@ -1197,7 +1835,7 @@ def api_data_on():
 def api_data_off():
     # v0.5.7: 异步断开, 立即返回, 避免 qmicli 卡死时前端长时间等待
     import threading
-    ctl = get_data_ctl()
+    ctl = get_data_ctl(_req_module())
     def _do_stop():
         try:
             ctl.stop()
@@ -1214,7 +1852,7 @@ def api_data_off():
 def api_data_ping():
     # v0.5.7: 按 wwan0 实际 IP 选 ping 目标 (有 IPv4 用 IPv4, 否则用 IPv6)
     # 用户可在页面输入框改目标
-    ctl = get_data_ctl()
+    ctl = get_data_ctl(_req_module())
     st = ctl.get_status()
     has_v4 = bool(st.get("ipv4"))
     has_v6 = bool(st.get("ipv6"))
@@ -1233,7 +1871,7 @@ def api_data_ping():
 @requires_auth
 def api_data_oplog():
     """QMI 操作日志 (拨号全过程, 供分析)."""
-    ctl = get_data_ctl()
+    ctl = get_data_ctl(_req_module())
     fn = getattr(ctl, "get_op_log", None)
     logs = fn(100) if fn else []
     return jsonify({"logs": logs})
@@ -1243,7 +1881,7 @@ def api_data_oplog():
 @requires_auth
 def api_data_oplog_clear():
     """清空 QMI 操作日志."""
-    ctl = get_data_ctl()
+    ctl = get_data_ctl(_req_module())
     fn = getattr(ctl, "clear_op_log", None)
     if fn:
         fn()
@@ -1254,7 +1892,7 @@ def api_data_oplog_clear():
 @requires_auth
 def api_data_ipchange_clear():
     """清除 IP 变化提醒标记 (用户已读)."""
-    ctl = get_data_ctl()
+    ctl = get_data_ctl(_req_module())
     fn = getattr(ctl, "clear_ip_change_flag", None)
     if fn:
         fn()
@@ -1265,7 +1903,7 @@ def api_data_ipchange_clear():
 @requires_auth
 def api_data_connectivity():
     """三段式连通性检查: bearer -> IP -> 互联网 (v4/v6 分开)."""
-    ctl = get_data_ctl()
+    ctl = get_data_ctl(_req_module())
     fn = getattr(ctl, "check_internet", None)
     if fn:
         return jsonify(fn())
@@ -1293,6 +1931,247 @@ def api_device_port():
         return jsonify({"ok": False, "error": f"保存失败: {e}"})
     return jsonify({"ok": True, "port": port,
                     "note": "需重启 scc-lite 服务生效"})
+
+
+# ----------------------------------------------------------------------
+# v0.6.0: 模块管理 API (多模块自助添加)
+# ----------------------------------------------------------------------
+@app.route("/api/modules")
+@requires_auth
+def api_modules_list():
+    """列出已注册模块."""
+    return jsonify({"modules": list_modules()})
+
+
+@app.route("/api/dashboard")
+@requires_auth
+def api_dashboard():
+    """v0.6.0: 仪表盘汇总, 一次返回所有模块状态.
+
+    每模块: 注册信息 + 设备缓存(信号/注册/运营商) + 数据状态 + 短信数.
+    """
+    mods = list_modules()
+    out = []
+    db = get_store()
+    try:
+        for m in mods:
+            imei = m.get("imei", "")
+            # 设备缓存 (_cache_get 直接返回 data 字典, 不是包装)
+            dev = _cache_get(f"device:{imei or 'default'}") or {}
+            dev_data = dev if isinstance(dev, dict) else {}
+            # 数据状态 (不触发拨号, 只读)
+            try:
+                ctl = get_data_ctl(imei or None)
+                dst = ctl.get_status()
+                data = {"connected": bool(dst.get("connected")),
+                        "ipv4": dst.get("ipv4") or dst.get("ip") or "",
+                        "iface": getattr(ctl, "iface", "")}
+            except Exception:
+                data = {"connected": False, "ipv4": "", "iface": ""}
+            # v0.6.1: 当前 SIM 的 IMSI (worker 每轮写入 modules.current_imsi)
+            cur_imsi = (m.get("current_imsi") or "").strip()
+            # 短信数 (v0.6.1: 按当前 SIM 的 IMSI 计, 不再按模块硬件计)
+            try:
+                if cur_imsi:
+                    c = db.execute(
+                        "SELECT COUNT(*) c FROM sms WHERE imsi=?",
+                        (cur_imsi,)).fetchone()["c"]
+                    u = db.execute(
+                        "SELECT COUNT(*) c FROM sms WHERE imsi=?"
+                        " AND direction='in' AND COALESCE(read,0)=0",
+                        (cur_imsi,)).fetchone()["c"]
+                else:
+                    c, u = 0, 0
+            except Exception:
+                c, u = 0, 0
+            # v0.6.1: 当前 SIM (IMSI + 用户填的号码)
+            sim_number = ""
+            if cur_imsi:
+                try:
+                    r = db.execute(
+                        "SELECT number FROM sim_numbers WHERE imsi=?",
+                        (cur_imsi,)).fetchone()
+                    sim_number = (r["number"] if r else "") or ""
+                except Exception:
+                    pass
+            out.append({
+                "imei": imei, "alias": m.get("alias", ""),
+                "port": m.get("port", ""), "profile": m.get("profile", ""),
+                "model": m.get("model", ""),
+                "enabled": bool(m.get("enabled", 1)),
+                # fallback: 识别出的型号不是 EC20, 但按 EC20 兼容模式跑
+                "fallback": bool(m.get("model")) and not
+                m.get("model", "").upper().startswith("EC20"),
+                "signal": dev_data.get("signal", {}),
+                "reg": dev_data.get("reg", {}),
+                "operator": dev_data.get("operator", {}),
+                # v0.6.0-fix: 运营商中文名 (COPS->IMSI兜底)
+                "carrier": dev_data.get("carrier", ""),
+                "current_imsi": cur_imsi,
+                "sim_number": sim_number,
+                "data": data, "sms_count": c, "unread": u,
+            })
+    finally:
+        db.close()
+    return jsonify({"modules": out})
+
+
+@app.route("/api/sms/read", methods=["POST"])
+@requires_auth
+def api_sms_read():
+    """v0.6.1: 按号码/IMSI 标记收件短信为已读 (不传则全标)."""
+    data = request.get_json(force=True) or {}
+    number = (data.get("number") or "").strip()
+    imsi = (data.get("imsi") or "").strip()
+    db = get_store()
+    try:
+        if number:
+            rows = db.execute(
+                "SELECT imsi FROM sim_numbers WHERE number=?",
+                (number,)).fetchall()
+            imsis = [r["imsi"] for r in rows]
+            if imsis:
+                ph = ",".join("?" * len(imsis))
+                db.execute(f"UPDATE sms SET read=1 WHERE imsi IN ({ph})"
+                           " AND direction='in'", imsis)
+        elif imsi:
+            db.execute("UPDATE sms SET read=1 WHERE imsi=? AND direction='in'",
+                       (imsi,))
+        else:
+            db.execute("UPDATE sms SET read=1 WHERE direction='in'")
+        db.commit()
+    finally:
+        db.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/modules/scan", methods=["POST"])
+@requires_auth
+def api_modules_scan():
+    """扫描串口: ATI 识别模块 + 占用检测 (只提示, 不 kill).
+
+    注意: 扫描会短暂打开空闲串口; 被 daemon/其他软件占用的口
+    只报告占用者, 不触碰.
+    """
+    try:
+        results = scan_ports()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    # 标出已注册的
+    registered = {m["imei"] for m in list_modules() if m.get("imei")}
+    for r in results:
+        r["registered"] = r.get("imei") in registered
+    return jsonify({"ok": True, "ports": results})
+
+
+@app.route("/api/modules/add", methods=["POST"])
+@requires_auth
+def api_modules_add():
+    """自助添加模块: {port, alias}.
+
+    打开该串口读 IMEI/ATI, 识别 profile (fallback EC20), 入库注册.
+    端口被占用时只返回提示, 不 kill 任何进程.
+    """
+    import re
+    data = request.get_json(force=True) or {}
+    port = (data.get("port") or "").strip()
+    alias = (data.get("alias") or "").strip()
+    if not re.fullmatch(r"/dev/[A-Za-z0-9_.-]+", port):
+        return jsonify({"ok": False, "error": "串口格式非法"})
+    # 1. 占用检查
+    try:
+        probe = __import__("serial").Serial(
+            port, baudrate=115200, timeout=2, exclusive=True)
+    except Exception:
+        from modem import _port_owner
+        return jsonify({"ok": False, "error": "端口被占用",
+                        "locked_by": _port_owner(port),
+                        "hint": "请自行检查占用进程, 或换一个端口"})
+    try:
+        m = Modem(port=port, baudrate=115200, timeout=10)
+        m.ser = probe  # 复用已打开的串口
+        try:
+            imei = m.get_imei()
+        except ModemError as e:
+            return jsonify({"ok": False, "error": f"读 IMEI 失败: {e}"})
+        if not imei:
+            return jsonify({"ok": False, "error": "读到空 IMEI"})
+        # 2. ATI 识别 profile
+        profile_name = "EC20Profile"
+        fallback = False
+        model = ""
+        if HAS_PROFILES:
+            try:
+                lines, _ = m.raw("ATI")
+                model_key, cls = _profile_detect("\n".join(lines))
+                profile_name = cls.__name__
+                model = model_key
+                from modem_profiles import REGISTRY
+                fallback = not any(
+                    (model_key or "").upper().startswith(k)
+                    for k in REGISTRY)
+            except Exception:
+                pass
+        ok = upsert_module_db(imei, alias=alias, port=port,
+                              profile=profile_name, enabled=1, model=model)
+        if not ok:
+            return jsonify({"ok": False, "error": "入库失败"})
+    finally:
+        try:
+            probe.close()
+        except Exception:
+            pass
+    return jsonify({"ok": True, "imei": imei, "model": model,
+                    "profile": profile_name, "fallback": fallback,
+                    "note": "已注册, 重启 scc-lite 后开始轮询" if fallback
+                    else "已注册, 重启 scc-lite 后开始轮询"})
+
+
+@app.route("/api/modules/<imei>", methods=["DELETE"])
+@requires_auth
+def api_modules_delete(imei):
+    """删除模块 (历史短信保留, 只停轮询)."""
+    db = get_store()
+    try:
+        db.execute("DELETE FROM modules WHERE imei=?", (imei,))
+        db.commit()
+    finally:
+        db.close()
+    # 清掉缓存的 DataControl 实例
+    _data_ctl_instances.pop(imei, None)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/modules/<imei>/alias", methods=["POST"])
+@requires_auth
+def api_modules_alias(imei):
+    alias = (request.get_json(force=True) or {}).get("alias", "").strip()
+    if not alias:
+        return jsonify({"ok": False, "error": "别名不能为空"})
+    db = get_store()
+    try:
+        db.execute("UPDATE modules SET alias=? WHERE imei=?", (alias, imei))
+        db.commit()
+    finally:
+        db.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/modules/<imei>/enable", methods=["POST"])
+@requires_auth
+def api_modules_enable(imei):
+    enable = bool((request.get_json(force=True) or {}).get("enable", True))
+    db = get_store()
+    try:
+        db.execute("UPDATE modules SET enabled=? WHERE imei=?",
+                   (1 if enable else 0, imei))
+        db.commit()
+    finally:
+        db.close()
+    if not enable:
+        _data_ctl_instances.pop(imei, None)
+    return jsonify({"ok": True,
+                    "note": "重启 scc-lite 后生效" if enable else "已停用"})
 
 
 @app.route("/api/account", methods=["GET"])
@@ -1888,7 +2767,7 @@ def api_account_change():
 def api_data_carrier():
     """运营商信息 + APN (自动识别)."""
     try:
-        m = _get_modem_for_data()
+        m = _get_modem_for_data(_req_module())
         try:
             info = get_carrier_info(m)
         finally:
@@ -1907,7 +2786,7 @@ def api_data_apn():
     if not apn:
         return jsonify({"ok": False, "error": "APN 不能为空"})
     try:
-        m = _get_modem_for_data()
+        m = _get_modem_for_data(_req_module())
         try:
             ok = provision_apn(m, apn)
         finally:
@@ -1925,7 +2804,7 @@ def api_data_apn():
 def api_data_mode():
     """查询当前 usbnet 模式."""
     try:
-        m = _get_modem_for_data()
+        m = _get_modem_for_data(_req_module())
         try:
             mode, name = get_usbnet_mode(m)
         finally:
@@ -1957,7 +2836,7 @@ def api_ussd():
     if not code:
         return jsonify({"ok": False, "error": "USSD 码必填"})
     try:
-        m = get_modem()
+        m = get_modem(_req_module())
         try:
             resp = m.ussd_send(code)
         finally:
@@ -1971,7 +2850,7 @@ def api_ussd():
 @requires_auth
 def api_ussd_cancel():
     try:
-        m = get_modem()
+        m = get_modem(_req_module())
         try:
             m.ussd_cancel()
         finally:
@@ -1984,13 +2863,15 @@ def api_ussd_cancel():
 @app.route("/api/at", methods=["POST"])
 @requires_auth
 def api_at():
-    cmd = request.get_json(force=True).get("cmd", "").strip()
+    data = request.get_json(force=True)
+    cmd = (data.get("cmd") or "").strip()
     if not cmd.upper().startswith("AT"):
         return jsonify({"ok": False, "error": "必须以 AT 开头"})
     try:
-        m = get_modem()
+        m = get_modem(_req_module())
         try:
-            lines, ok = m.raw(cmd)
+            # v0.6.0: raw_verbose 保留结束标记行 (OK/ERROR/+CME ERROR...)
+            lines, ok = m.raw_verbose(cmd)
         finally:
             m.close()
         return jsonify({"ok": ok, "lines": lines})

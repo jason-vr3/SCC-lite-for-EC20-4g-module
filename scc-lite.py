@@ -29,10 +29,18 @@ import sys
 import time
 import yaml
 
-VERSION = "0.5.9"  # v0.5.9: 长短信 PDU 重组
+VERSION = "0.6.0"  # v0.6.0: 多模块 + 适配层 + 自助扫描
 
 from modem import Modem, ModemError, decode_ucs2, is_ucs2_hex
 from notifications import Notifier
+
+try:
+    from modem_profiles import get_profile, detect
+    HAS_PROFILES = True
+except ImportError:
+    HAS_PROFILES = False
+    get_profile = None
+    detect = None
 
 try:
     from qq_receiver import QQReceiver
@@ -56,7 +64,9 @@ CREATE TABLE IF NOT EXISTS sms (
     body        TEXT,
     sms_time    TEXT,             -- modem timestamp
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    forwarded   INTEGER DEFAULT 0 -- 1 if pushed to notifications
+    forwarded   INTEGER DEFAULT 0, -- 1 if pushed to notifications
+    module_id   TEXT DEFAULT '',  -- v0.6.0: 所属模块 IMEI, 多模块隔离
+    read        INTEGER DEFAULT 0 -- v0.6.0: 1=用户已读 (Web 标记)
 );
 CREATE INDEX IF NOT EXISTS idx_sms_created ON sms(created_at);
 CREATE TABLE IF NOT EXISTS kv (
@@ -76,6 +86,16 @@ CREATE TABLE IF NOT EXISTS forward_queue (
     UNIQUE(sms_id, channel)
 );
 CREATE INDEX IF NOT EXISTS idx_fwd_status ON forward_queue(status, next_retry);
+-- v0.6.0: 模块注册表 (IMEI 主键, 端口可变自动重绑)
+CREATE TABLE IF NOT EXISTS modules (
+    imei      TEXT PRIMARY KEY,
+    alias     TEXT DEFAULT '',
+    port      TEXT DEFAULT '',
+    profile   TEXT DEFAULT 'EC20Profile',
+    model     TEXT DEFAULT '',   -- v0.6.0: ATI 识别到的型号
+    enabled   INTEGER DEFAULT 1,
+    added_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -94,28 +114,64 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        # v0.6.0 迁移: 老库加 module_id 列 / modules 表
+        self._migrate()
         self.db.commit()
 
-    def save_incoming(self, modem_index, sender, body, sms_time):
-        # Avoid duplicates: check if same sender/time/body exists
+    def _migrate(self):
+        """老版本数据库迁移 (幂等)."""
+        cols = [r["name"] for r in
+                self.db.execute("PRAGMA table_info(sms)").fetchall()]
+        if "module_id" not in cols:
+            self.db.execute("ALTER TABLE sms ADD COLUMN module_id TEXT DEFAULT ''")
+            log.info("migrated: sms.module_id added")
+        if "read" not in cols:
+            self.db.execute("ALTER TABLE sms ADD COLUMN read INTEGER DEFAULT 0")
+            log.info("migrated: sms.read added")
+        if "imsi" not in cols:
+            self.db.execute("ALTER TABLE sms ADD COLUMN imsi TEXT DEFAULT ''")
+            log.info("migrated: sms.imsi added")
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sms_module ON sms(module_id)")
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sms_imsi ON sms(imsi)")
+        # v0.6.1: IMSI->号码映射表 (用户自助维护, 多 IMSI 可同号/补卡)
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS sim_numbers (
+                imsi TEXT PRIMARY KEY,
+                number TEXT DEFAULT '',
+                alias TEXT DEFAULT '',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # v0.6.1: 模块当前 IMSI (worker 每轮写, web 直接查"号码现在在哪个模块")
+        mcols = [r[1] for r in self.db.execute(
+            "PRAGMA table_info(modules)").fetchall()]
+        if "current_imsi" not in mcols:
+            self.db.execute(
+                "ALTER TABLE modules ADD COLUMN current_imsi TEXT DEFAULT ''")
+            log.info("migrated: modules.current_imsi added")
+
+    def save_incoming(self, modem_index, sender, body, sms_time,
+                      module_id="", imsi=""):
+        # v0.6.1: 去重键加入 imsi (多卡同收一条群发不误杀)
         cur = self.db.execute(
-            "SELECT id FROM sms WHERE direction='in' AND sender=? AND sms_time=? AND body=?",
-            (sender, sms_time, body))
+            "SELECT id FROM sms WHERE direction='in' AND sender=? AND sms_time=? AND body=?"
+            " AND COALESCE(imsi,'')=COALESCE(?, '')",
+            (sender, sms_time, body, imsi))
         row = cur.fetchone()
         if row:
             return row["id"]
         cur = self.db.execute(
-            "INSERT INTO sms (modem_index, direction, sender, body, sms_time)"
-            " VALUES (?,?,?,?,?)",
-            (modem_index, "in", sender, body, sms_time))
+            "INSERT INTO sms (modem_index, direction, sender, body, sms_time, module_id, imsi)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (modem_index, "in", sender, body, sms_time, module_id, imsi))
         self.db.commit()
         return cur.lastrowid
 
-    def save_outgoing(self, recipient, body):
+    def save_outgoing(self, recipient, body, module_id="", imsi=""):
         cur = self.db.execute(
-            "INSERT INTO sms (direction, sender, body, forwarded)"
-            " VALUES ('out',?,?,1)",
-            (recipient, body))
+            "INSERT INTO sms (direction, sender, body, forwarded, module_id, imsi)"
+            " VALUES ('out',?,?,1,?,?)",
+            (recipient, body, module_id, imsi))
         self.db.commit()
         return cur.lastrowid
 
@@ -190,73 +246,333 @@ class Store:
             " WHERE status IN ('pending','failed')")
         return cur.fetchone()["c"]
 
+    # ---- v0.6.0: 模块注册表 (IMEI 主键) ----
+    def upsert_module(self, imei, alias="", port="", profile="EC20Profile",
+                      enabled=1, model=""):
+        """新增或更新模块 (端口变化自动重绑)."""
+        if not imei:
+            return
+        if not alias:
+            alias = f"{profile.replace('Profile', '')}-{imei[-4:]}"
+        cols = [r["name"] for r in
+                self.db.execute("PRAGMA table_info(modules)").fetchall()]
+        if "model" not in cols:
+            self.db.execute("ALTER TABLE modules ADD COLUMN model TEXT DEFAULT ''")
+        self.db.execute(
+            "INSERT INTO modules (imei, alias, port, profile, model, enabled)"
+            " VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT(imei) DO UPDATE SET"
+            " alias=excluded.alias, port=excluded.port,"
+            " profile=excluded.profile, model=excluded.model,"
+            " enabled=excluded.enabled",
+            (imei, alias, port, profile, model, enabled))
+        self.db.commit()
+
+    def get_modules(self, only_enabled=False):
+        q = "SELECT * FROM modules"
+        if only_enabled:
+            q += " WHERE enabled=1"
+        q += " ORDER BY added_at"
+        return [dict(r) for r in self.db.execute(q).fetchall()]
+
+    def set_module_enabled(self, imei, enabled):
+        self.db.execute("UPDATE modules SET enabled=? WHERE imei=?",
+                        (1 if enabled else 0, imei))
+        self.db.commit()
+
+    def delete_module(self, imei):
+        """删除模块 (历史短信保留, 只停轮询)."""
+        self.db.execute("DELETE FROM modules WHERE imei=?", (imei,))
+        self.db.commit()
+
+    def set_module_alias(self, imei, alias):
+        self.db.execute("UPDATE modules SET alias=? WHERE imei=?",
+                        (alias, imei))
+        self.db.commit()
+
+    def backfill_module_id(self):
+        """单启用模块时, 把 module_id 为空的历史短信归属到该模块.
+
+        v0.5.9 升上来的老短信 module_id 为空, 会被按模块过滤隐藏,
+        看起来像"丢失". 幂等, 无空值时零开销.
+        返回回填条数.
+        """
+        mods = self.get_modules(only_enabled=True)
+        if len(mods) != 1 or not mods[0].get("imei"):
+            return 0
+        imei = mods[0]["imei"]
+        cur = self.db.execute(
+            "UPDATE sms SET module_id=? WHERE module_id='' OR module_id IS NULL",
+            (imei,))
+        n = cur.rowcount
+        if n:
+            log.info("backfilled %d sms to module %s", n, imei)
+        self.db.commit()
+        return n
+
+    # ---- v0.6.1: IMSI 为纲 ----
+    def get_sim_numbers(self):
+        cur = self.db.execute(
+            "SELECT imsi, number, alias, updated_at FROM sim_numbers ORDER BY number, imsi")
+        return [dict(r) for r in cur.fetchall()]
+
+    def ensure_sim_number(self, imsi):
+        """新 IMSI 自动发现: 无则插入空号码待填. 幂等."""
+        if not imsi:
+            return None
+        self.db.execute(
+            "INSERT OR IGNORE INTO sim_numbers (imsi) VALUES (?)", (imsi,))
+        self.db.commit()
+        cur = self.db.execute(
+            "SELECT imsi, number, alias FROM sim_numbers WHERE imsi=?", (imsi,))
+        return dict(cur.fetchone())
+
+    def upsert_sim_number(self, imsi, number="", alias=""):
+        self.db.execute(
+            """INSERT INTO sim_numbers (imsi, number, alias, updated_at)
+               VALUES (?,?,?,CURRENT_TIMESTAMP)
+               ON CONFLICT(imsi) DO UPDATE SET
+                 number=excluded.number, alias=excluded.alias,
+                 updated_at=CURRENT_TIMESTAMP""",
+            (imsi, number.strip(), alias.strip()))
+        self.db.commit()
+
+    def delete_sim_number(self, imsi):
+        self.db.execute("DELETE FROM sim_numbers WHERE imsi=?", (imsi,))
+        self.db.commit()
+
+    def set_module_current_imsi(self, imei, imsi):
+        """worker 每轮写当前 IMSI, web 查"号码现在在哪个模块"."""
+        self.db.execute("UPDATE modules SET current_imsi=? WHERE imei=?",
+                        (imsi or "", imei))
+        self.db.commit()
+
+    def backfill_imsi(self):
+        """老短信 imsi 回填 (fallback, 幂等).
+
+        只有"唯一 IMSI"时才自动回填 (单卡用户零歧义).
+        多 IMSI/换过卡时不猜, 由用户在页面手动归属.
+        返回回填条数.
+        """
+        cur = self.db.execute(
+            "SELECT COUNT(*) c FROM sms WHERE imsi='' OR imsi IS NULL")
+        if not cur.fetchone()["c"]:
+            return 0
+        # 候选 IMSI: sim_numbers 去重后
+        rows = self.db.execute(
+            "SELECT DISTINCT imsi FROM sim_numbers WHERE imsi<>''").fetchall()
+        imsis = [r["imsi"] for r in rows]
+        if len(imsis) != 1:
+            return 0
+        cur = self.db.execute(
+            "UPDATE sms SET imsi=? WHERE imsi='' OR imsi IS NULL", (imsis[0],))
+        n = cur.rowcount
+        if n:
+            log.info("backfilled %d sms imsi to %s", n, imsis[0])
+        self.db.commit()
+        return n
+
+    def imsis_for_number(self, number):
+        """某号码名下所有 IMSI (补卡合并)."""
+        rows = self.db.execute(
+            "SELECT imsi FROM sim_numbers WHERE number=?", (number,)).fetchall()
+        return [r["imsi"] for r in rows]
+
 
 # ----------------------------------------------------------------------
 # Daemon
 # ----------------------------------------------------------------------
-class Daemon:
-    def __init__(self, config):
-        self.cfg = config
-        modem_cfg = config.get("modem", {})
+# ----------------------------------------------------------------------
+# v0.6.0: 多模块架构
+# Daemon (supervisor) 管理多个 ModuleWorker, 每个模块独立线程轮询.
+# 模块以 IMEI 为唯一标识, 端口变化自动重绑.
+# ----------------------------------------------------------------------
+class ModuleWorker:
+    """单模块轮询 worker.
+
+    每个模块一个实例, 跑在独立线程:
+      - 独立 Modem / _seen / _concat_buf (长短信重组缓冲)
+      - 短信存库时带 module_id=IMEI, 各模块收件箱隔离
+    """
+
+    def __init__(self, mod_cfg, store, notifier, data_path, sms_cfg):
+        self.imei = mod_cfg.get("imei", "")
+        self.alias = mod_cfg.get("alias") or self.imei[-4:]
+        self.port = mod_cfg.get("port", "/dev/ttyUSB3")
+        self.profile_name = mod_cfg.get("profile", "EC20Profile")
         self.modem = Modem(
-            port=modem_cfg.get("port", "/dev/ttyUSB3"),
-            baudrate=modem_cfg.get("baudrate", 115200),
-            timeout=modem_cfg.get("timeout", 10),
+            port=self.port,
+            baudrate=mod_cfg.get("baudrate", 115200),
+            timeout=mod_cfg.get("timeout", 10),
         )
-        sms_cfg = config.get("sms", {})
+        self.store = store
+        self.notifier = notifier
+        self.data_path = data_path
         self.poll_interval = sms_cfg.get("poll_interval", 15)
         self.delete_after_forward = sms_cfg.get("delete_after_forward", True)
-
-        data_path = config.get("data_dir", "/opt/scc-lite-for-EC20-4g-module/data")
-        os.makedirs(data_path, exist_ok=True)
-        self.data_path = data_path  # v0.5.7: 存为实例属性, 供其他方法使用
-        self.store = Store(os.path.join(data_path, "scc-lite.db"))
-        self.notifier = Notifier(config.get("notifications", {}))
-
-        # Track seen modem indexes to avoid re-processing
         self._seen = set()
-        # v0.5.9: 长短信重组缓冲 {(sender, ref): {total, parts:{seq:body},
-        #   indices:[...], time, first_seen}}
         self._concat_buf = {}
+        self._stop = False
+        self._profile = None
+        # v0.6.1: IMSI 为纲. current_imsi 跟 SIM 卡走 (热插拔自动跟上).
+        # _imsi_window: 最近 3 轮读取成败滑动窗口, >=2 失败则置空.
+        from collections import deque
+        self.current_imsi = ""
+        self._imsi_window = deque(maxlen=3)
 
-    def reload_notifications(self, notif_cfg):
-        self.notifier.reload(notif_cfg)
+    def label(self):
+        return f"{self.alias}({self.port})"
 
-    def _decode_body(self, raw):
-        """Decode SMS body: UCS2 hex -> text if applicable."""
-        raw = (raw or "").strip()
-        if is_ucs2_hex(raw):
-            return decode_ucs2(raw)
-        return raw
+    def stop(self):
+        self._stop = True
+
+    def _load_profile(self):
+        """按配置加载适配 profile (检测失败则 fallback EC20)."""
+        if not HAS_PROFILES:
+            return None
+        try:
+            cls = get_profile("")
+            # 配置里存的是类名, 如 EC20Profile
+            import modem_profiles
+            cls = getattr(modem_profiles, self.profile_name,
+                          modem_profiles.DEFAULT_PROFILE)
+            self._profile = cls()
+            return self._profile
+        except Exception as e:
+            log.warning("[%s] profile 加载失败: %s", self.label(), e)
+            return None
+
+    def _resolve_imei(self):
+        """运行时读 IMEI: 补全空 IMEI / 校验端口是否换了模块."""
+        try:
+            imei = self.modem.get_imei()
+        except ModemError:
+            return
+        if not imei:
+            return
+        if not self.imei:
+            # 首次: 回填 IMEI
+            self.imei = imei
+            self.store.upsert_module(imei, alias=self.alias,
+                                     port=self.port,
+                                     profile=self.profile_name,
+                                     enabled=1)
+            log.info("[%s] IMEI 回填: %s", self.label(), imei)
+            # v0.6.0-fix: 老短信 module_id 为空会被过滤隐藏, 回填归属
+            try:
+                self.store.backfill_module_id()
+            except Exception as e:
+                log.warning("[%s] backfill failed: %s", self.label(), e)
+        elif imei != self.imei:
+            log.warning("[%s] 端口上模块变了: 配置 %s, 实际 %s",
+                        self.label(), self.imei, imei)
+
+    def run(self):
+        log.info("[%s] worker starting, IMEI=%s", self.label(), self.imei or "?")
+        self._load_profile()
+        # prime
+        try:
+            self.modem.open()
+            log.info("[%s] modem opened", self.label())
+            self._resolve_imei()
+            self._refresh_imsi()
+            try:
+                self.modem.set_cnmi(2, 1, 0, 0, 0)
+            except ModemError as e:
+                log.warning("[%s] set_cnmi failed: %s", self.label(), e)
+            for m in self.modem.sms_list_pdu(4):
+                dec = m.get("decoded")
+                if not dec:
+                    continue
+                key = (dec["sender"], dec["time"], dec["body"][:32])
+                self._seen.add(key)
+                row_id = self.store.save_incoming(
+                    m["index"], dec["sender"], dec["body"], dec["time"],
+                    module_id=self.imei)
+                self.store.mark_forwarded(row_id)
+            log.info("[%s] primed %d existing messages", self.label(),
+                     len(self._seen))
+        except ModemError as e:
+            log.warning("[%s] prime failed: %s", self.label(), e)
+        finally:
+            try:
+                self.modem.close()
+            except Exception:
+                pass
+        # poll loop
+        while not self._stop:
+            try:
+                n = self.poll_once()
+                if n:
+                    log.info("[%s] poll: %d new", self.label(), n)
+            except Exception as e:
+                log.warning("[%s] poll cycle error: %s", self.label(), e)
+            # 可中断的 sleep
+            for _ in range(self.poll_interval * 2):
+                if self._stop:
+                    break
+                time.sleep(0.5)
+        log.info("[%s] worker stopped", self.label())
+
+    def _refresh_imsi(self):
+        """v0.6.1: 每轮跟大轮询读 IMSI (不额外增加读取机制).
+
+        3 轮滑动窗口容错: 单次偶发读不到用缓存, 3 轮内 >=2 次读不到则置空.
+        SIM 热插拔自动跟上, 无需重启. 新 IMSI 自动发现进 sim_numbers 待填号码.
+        """
+        imsi = ""
+        try:
+            imsi = (self.modem.get_imsi() or "").strip()
+        except Exception:
+            imsi = ""
+        self._imsi_window.append(bool(imsi))
+        if imsi:
+            if imsi != self.current_imsi:
+                log.info("[%s] SIM IMSI: %s -> %s", self.label(),
+                         self.current_imsi or "(无)", imsi)
+                self.current_imsi = imsi
+            # v0.6.0-fix: 每轮都 ensure (INSERT OR IGNORE, 自愈误删)
+            try:
+                self.store.ensure_sim_number(imsi)
+            except Exception as e:
+                log.warning("[%s] ensure_sim_number failed: %s",
+                            self.label(), e)
+        elif sum(1 for ok in self._imsi_window if not ok) >= 2:
+            if self.current_imsi:
+                log.warning("[%s] IMSI 连续读不到, 置空", self.label())
+                self.current_imsi = ""
+        # 写回 modules.current_imsi, web 查"号码现在在哪个模块"
+        if self.imei:
+            try:
+                self.store.set_module_current_imsi(self.imei, self.current_imsi)
+            except Exception:
+                pass
 
     def poll_once(self):
-        """One SMS poll cycle. Returns number of new messages.
-        v0.5.9: PDU 模式读取, 长短信按 UDH (ref/total/seq) 重组后存一条."""
+        """One SMS poll cycle. Returns number of new messages."""
         import time as _time
         try:
             self.modem.open()
         except ModemError as e:
-            log.warning("poll: cannot open modem: %s", e)
+            log.warning("[%s] poll: cannot open modem: %s", self.label(), e)
             return 0
         try:
+            self._refresh_imsi()
             try:
                 msgs = self.modem.sms_list_pdu(4)
-                log.info("poll: modem returned %d messages (pdu)", len(msgs))
             except ModemError as e:
-                log.warning("sms_list_pdu failed: %s", e)
+                log.warning("[%s] sms_list_pdu failed: %s", self.label(), e)
                 return 0
 
             new_count = 0
             for m in msgs:
                 idx = m["index"]
-                # PDU stat: 0=未读, 1=已读; 只处理收件箱
                 if str(m["stat"]) not in ("0", "1"):
                     continue
                 dec = m.get("decoded")
                 if not dec:
-                    # 解析失败的不删, 留待下次; 打日志便于排查
-                    log.warning("poll: idx=%d PDU 解析失败, 跳过 (不删除)",
-                                idx)
+                    log.warning("[%s] poll: idx=%d PDU 解析失败, 跳过",
+                                self.label(), idx)
                     continue
                 key = (dec["sender"], dec["time"], dec["body"][:32])
                 if key in self._seen:
@@ -267,9 +583,10 @@ class Daemon:
                     self._concat_add(idx, dec)
                 else:
                     row_id = self.store.save_incoming(
-                        idx, dec["sender"], dec["body"], dec["time"])
-                    log.info("new SMS from %s: %s",
-                             dec["sender"], dec["body"][:60])
+                        idx, dec["sender"], dec["body"], dec["time"],
+                        module_id=self.imei, imsi=self.current_imsi)
+                    log.info("[%s] new SMS from %s: %s",
+                             self.label(), dec["sender"], dec["body"][:60])
                     new_count += 1
                     self._queue_forward(row_id)
                     self._try_delete(idx)
@@ -282,7 +599,7 @@ class Daemon:
         finally:
             try:
                 self.modem.close()
-            except:
+            except Exception:
                 pass
 
     def _concat_add(self, idx, dec):
@@ -295,20 +612,18 @@ class Daemon:
                    "indices": [], "time": dec["time"],
                    "first_seen": _time.time()}
             self._concat_buf[key] = buf
-        # total 不一致时以最大的为准 (异常保护)
         if dec["total"] > buf["total"]:
             buf["total"] = dec["total"]
         if dec["seq"] not in buf["parts"]:
             buf["parts"][dec["seq"]] = dec["body"]
             buf["indices"].append(idx)
-            log.info("concat part %d/%d from %s (ref %s)",
-                     dec["seq"], dec["total"], dec["sender"], dec["ref"])
-        # 分片已存缓冲, 从模块删除防 SIM 满
+            log.info("[%s] concat part %d/%d from %s (ref %s)",
+                     self.label(), dec["seq"], dec["total"],
+                     dec["sender"], dec["ref"])
         self._try_delete(idx)
 
     def _concat_flush(self, now):
-        """检查缓冲, 完整的重组存库. 返回新增条数.
-        超 24h 未收齐的按已有分片存一条 (标注不完整)."""
+        """检查缓冲, 完整的重组存库. 返回新增条数."""
         done = 0
         stale_keys = []
         for key, buf in self._concat_buf.items():
@@ -322,17 +637,17 @@ class Daemon:
             sender = key[0]
             if complete:
                 body = "".join(parts[s] for s in range(1, total + 1))
-                log.info("concat complete from %s: %d parts, %d chars",
-                         sender, total, len(body))
+                log.info("[%s] concat complete from %s: %d parts",
+                         self.label(), sender, total)
             else:
-                # 超时未收齐: 按序号拼现有分片
                 seqs = sorted(parts.keys())
                 body = "".join(parts[s] for s in seqs)
                 body += f" [分片不完整 {len(seqs)}/{total}]"
-                log.warning("concat incomplete from %s: %d/%d parts",
-                            sender, len(seqs), total)
+                log.warning("[%s] concat incomplete from %s: %d/%d",
+                            self.label(), sender, len(seqs), total)
             row_id = self.store.save_incoming(
-                -1, sender, body, buf["time"])
+                -1, sender, body, buf["time"], module_id=self.imei,
+                imsi=self.current_imsi)
             done += 1
             self._queue_forward(row_id)
             stale_keys.append(key)
@@ -341,24 +656,70 @@ class Daemon:
         return done
 
     def _queue_forward(self, row_id):
-        """按配置渠道排队转发."""
         channels = [n for n in ("qq", "telegram", "webhook", "bark")
                     if self.notifier._get_channel(n) is not None]
         if channels:
             self.store.queue_forward(row_id, channels)
-            log.info("queued forward for sms %d via %s", row_id, channels)
 
     def _try_delete(self, idx):
-        """从模块删除短信 (防 SIM 满), 失败只记日志."""
         if not self.delete_after_forward:
             return
         try:
             self.modem.sms_delete(idx)
         except ModemError as e:
-            log.warning("delete idx %d failed: %s", idx, e)
+            log.warning("[%s] delete idx %d failed: %s",
+                        self.label(), idx, e)
+
+
+class Daemon:
+    """Supervisor: 管理多个 ModuleWorker + 集中处理转发队列.
+
+    v0.6.0: 配置从单 modem 改为 modules[] 列表, 自动迁移老配置.
+    """
+
+    def __init__(self, config):
+        self.cfg = config
+        sms_cfg = config.get("sms", {})
+        self.poll_interval = sms_cfg.get("poll_interval", 15)
+
+        data_path = config.get("data_dir", "/opt/scc-lite-for-EC20-4g-module/data")
+        os.makedirs(data_path, exist_ok=True)
+        self.data_path = data_path
+        self.store = Store(os.path.join(data_path, "scc-lite.db"))
+        self.notifier = Notifier(config.get("notifications", {}))
+
+        # 配置迁移: 老 modem: -> modules 注册表
+        self._migrate_config(config)
+        self.workers = {}  # imei -> (ModuleWorker, Thread)
+
+    def _migrate_config(self, config):
+        """v0.6.0 迁移: config 里 modules[] -> DB 注册表;
+        老 modem: 单端口 -> 记为 legacy_port, 由 worker 运行时读 IMEI 后回填."""
+        modules = config.get("modules")
+        if modules:
+            for m in modules:
+                if not m.get("imei"):
+                    continue
+                self.store.upsert_module(
+                    m.get("imei"), alias=m.get("alias", ""),
+                    port=m.get("port", "/dev/ttyUSB3"),
+                    profile=m.get("profile", "EC20Profile"),
+                    enabled=1 if m.get("enabled", True) else 0)
+            log.info("migrated %d modules from config", len(modules))
+            self._legacy_port = ""
+            return
+        # 老配置: 单 modem, 端口暂存, worker 运行时回填 IMEI
+        modem_cfg = config.get("modem", {})
+        self._legacy_port = modem_cfg.get("port", "/dev/ttyUSB3")
+        if not self.store.get_modules():
+            log.info("legacy modem port %s will be registered on first run",
+                     self._legacy_port)
+
+    def reload_notifications(self, notif_cfg):
+        self.notifier.reload(notif_cfg)
 
     def process_forward_queue(self):
-        """Background worker: (re)try pending forwards with backoff."""
+        """集中处理转发队列 (多模块共享)."""
         try:
             rows = self.store.get_pending_forwards()
         except Exception as e:
@@ -369,7 +730,6 @@ class Daemon:
                 r["channel"], r["sender"], r["body"], r["sms_time"] or "")
             if ok:
                 self.store.mark_forward_sent(r["id"])
-                # Mark sms forwarded if at least one channel succeeded
                 self.store.mark_forwarded(r["sms_id"])
                 log.info("forwarded sms %d via %s", r["sms_id"], r["channel"])
             else:
@@ -378,47 +738,33 @@ class Daemon:
                 log.warning("forward sms %d via %s failed (attempt %d)",
                             r["sms_id"], r["channel"], attempts)
 
+    def _spawn_workers(self):
+        import threading
+        mods = self.store.get_modules(only_enabled=True)
+        if not mods and getattr(self, "_legacy_port", ""):
+            # 老配置迁移: 临时模块, IMEI 由 worker 运行时回填入库
+            mods = [{"imei": "", "alias": "", "port": self._legacy_port,
+                     "baudrate": 115200, "timeout": 10,
+                     "profile": "EC20Profile", "enabled": 1}]
+        for mod in mods:
+            imei = mod["imei"] or mod["port"]  # 未回填 IMEI 前用端口做 key
+            if imei in self.workers:
+                continue
+            sms_cfg = self.cfg.get("sms", {})
+            w = ModuleWorker(mod, self.store, self.notifier,
+                             self.data_path, sms_cfg)
+            t = threading.Thread(target=w.run, daemon=True,
+                                 name=f"scc-mod-{imei[-4:]}")
+            t.start()
+            self.workers[imei] = (w, t)
+            log.info("worker started for %s", w.label())
+
     def run(self):
-        log.info("SCC-lite daemon starting, port=%s interval=%ds",
-                 self.modem.port, self.poll_interval)
-        # Prime _seen with existing messages; also save to DB so UI can see them
-        # (mark as forwarded to avoid re-notifying on every restart)
-        # Open/close modem for prime (releases lock after)
-        try:
-            self.modem.open()
-            log.info("modem opened: %s", self.modem.port)
-            try:
-                imei = self.modem.get_imei()
-                log.info("modem IMEI: %s", imei)
-            except ModemError as e:
-                log.warning("get_imei failed: %s", e)
-            # Enable instant new-SMS URC (+CMTI) per open-source practice
-            # (gammu, macsatcom). Polling remains as fallback.
-            try:
-                self.modem.set_cnmi(2, 1, 0, 0, 0)
-                log.info("CNMI set to 2,1,0,0,0 (+CMTI URC enabled)")
-            except ModemError as e:
-                log.warning("set_cnmi failed: %s", e)
-            for m in self.modem.sms_list_pdu(4):
-                dec = m.get("decoded")
-                if not dec:
-                    log.warning("prime: idx=%d PDU 解析失败", m["index"])
-                    continue
-                key = (dec["sender"], dec["time"], dec["body"][:32])
-                self._seen.add(key)
-                # save_incoming returns existing id if duplicate
-                row_id = self.store.save_incoming(
-                    m["index"], dec["sender"], dec["body"], dec["time"])
-                # Mark as forwarded so restart doesn't re-notify
-                self.store.mark_forwarded(row_id)
-            log.info("primed %d existing messages", len(self._seen))
-        except ModemError as e:
-            log.warning("prime failed: %s", e)
-        finally:
-            try:
-                self.modem.close()
-            except:
-                pass
+        log.info("SCC-lite daemon starting (v%s), multi-module mode",
+                 VERSION)
+        self._spawn_workers()
+        if not self.workers:
+            log.warning("no modules enabled, daemon idle")
 
         # Start QQ WebSocket receiver if configured (captures openids)
         qq_cfg = self.cfg.get("notifications", {}).get("qq", {})
@@ -426,7 +772,6 @@ class Daemon:
             try:
                 from notifications import QQBot
                 import qq_receiver
-                # openid 存到 data_dir，和 SQLite 放一起
                 qq_receiver.set_openid_file(
                     os.path.join(self.data_path, "qq_openids.json"))
                 bot = QQBot(qq_cfg.get("app_id"), qq_cfg.get("app_secret"), "")
@@ -439,7 +784,6 @@ class Daemon:
         elif qq_cfg.get("enabled"):
             log.info("QQ receiver not started (need websocket-client: pip install websocket-client)")
 
-        # Startup recovery: process any pending forwards from before restart
         pending = self.store.count_pending_forwards()
         if pending:
             log.info("startup: %d pending forwards to retry", pending)
@@ -447,23 +791,28 @@ class Daemon:
 
         while True:
             try:
-                # Hot-reload notification config if web UI changed it
                 try:
                     mtime = os.path.getmtime(self.config_path)
                     if mtime != self.config_mtime:
                         self.config_mtime = mtime
                         new_cfg = load_config(self.config_path)
                         self.notifier.reload(new_cfg.get("notifications", {}))
-                        log.info("notification config reloaded")
+                        # 新加的模块: 补起 worker
+                        self._migrate_config(new_cfg)
+                        self._spawn_workers()
+                        log.info("config reloaded")
                 except Exception as e:
                     log.debug("config reload check failed: %s", e)
-                n = self.poll_once()
-                if n:
-                    log.info("poll: %d new", n)
-                # Process forward queue (retries) each cycle
                 self.process_forward_queue()
             except Exception as e:
-                log.warning("poll cycle error: %s", e)
+                log.warning("supervisor cycle error: %s", e)
+            # v0.6.0-fix: 周期性回填空 module_id (幂等, 无空值时零开销)
+            # v0.6.1: 老短信 imsi 回填 (fallback, 单 IMSI 才自动)
+            try:
+                self.store.backfill_module_id()
+                self.store.backfill_imsi()
+            except Exception:
+                pass
             time.sleep(self.poll_interval)
 
 
@@ -471,6 +820,9 @@ class Daemon:
 # Config
 # ----------------------------------------------------------------------
 DEFAULT_CONFIG = {
+    # v0.6.0: 多模块. 老 modem: 单端口配置自动迁移为 modules[0].
+    # modules: [{imei, alias, port, baudrate, profile, enabled}]
+    "modules": [],
     "modem": {"port": "/dev/ttyUSB3", "baudrate": 115200, "timeout": 10},
     "sms": {"poll_interval": 15, "delete_after_forward": True},
     "data_dir": "/opt/scc-lite-for-EC20-4g-module/data",
