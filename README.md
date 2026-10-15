@@ -47,8 +47,14 @@ with push notifications to QQ / Telegram / Webhook / Bark.
   Character count: 70 for Chinese, 160 for English
 - 📊 **设备监控**：IMEI/IMSI/ICCID、信号 RSSI、网络注册、运营商、QMI 数据控制
   Device monitoring: IMEI/IMSI/ICCID, signal, registration, carrier, QMI data control
-- 🔧 **AT 终端 / USSD / 飞行模式**：Web 直接操作模块
-  AT terminal / USSD / airplane mode via Web UI
+- 📑 **多模块**：自助扫描添加多个 4G 模块，每模块独立标签页、独立拨号上网
+  Multi-module: scan-add multiple 4G modules, per-module tabs and independent dial-up
+- 🔢 **号码管理**：IMSI 为纲的号码映射，短信按 IMSI 归档，换卡不丢记录
+  Number management: IMSI-based mapping, SMS archived per IMSI, SIM swap safe
+- 📈 **卡片仪表盘**：每模块 IMEI+运营商+信号+数据开关一目了然
+  Card dashboard: per-module IMEI, carrier, signal and data toggle at a glance
+- 🔧 **AT 终端 / USSD / 飞行模式**：Web 直接操作模块，显示全部最终结果码
+  AT terminal / USSD / airplane mode via Web UI, all final result codes shown
 
 ### 已知限制 / Known Limitations
 
@@ -81,7 +87,7 @@ with push notifications to QQ / Telegram / Webhook / Bark.
 
 ```bash
 # 1. 解压 / Extract
-tar xzf scc-lite-for-EC20-4g-module-v0.5.0.tar.gz
+tar xzf scc-lite-v0.6.0-full.tar.gz
 cd scc-lite-for-EC20-4g-module
 
 # 2. 安装 / Install
@@ -151,10 +157,18 @@ scc-lite-for-EC20-4g-module/
 ├── scc-lite.py       # 短信守护进程：轮询/入库/转发队列 (daemon)
 ├── scc-web.py        # Web 管理界面 (Flask, :7577)
 ├── modem.py          # AT 指令封装 (3GPP TS 27.007 / Quectel)
+├── modem_profiles/   # 模块适配层 (EC20/EC25)
+├── sms_pdu.py        # PDU 编解码：长短信分片重组
 ├── notifications.py  # 推送渠道 (QQ/Telegram/Webhook/Bark)
 ├── qq_receiver.py    # QQ WebSocket 接收 (抓 openid)
 ├── data_control.py   # QMI 数据连接控制
-├── config.yaml       # 配置文件
+├── apn_db.py         # APN 数据库 (IMSI/运营商识别)
+├── ec20_data.py      # EC20 资料数据
+├── at_cheatsheet.py  # AT 指令速查数据
+├── udhcpc-noroute.sh # DHCP 脚本：只配 IP，不加路由
+├── apns-conf.xml     # APN 库数据源
+├── new_template.html # Web 前端模板
+├── config.yaml.example # 配置文件示例
 ├── install.sh        # 一键安装脚本
 ├── scc-lite.service  # systemd 服务
 ├── scc-web.service   # systemd 服务
